@@ -424,6 +424,51 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--semantic-provider",
+        choices=("lraspp", "segformer"),
+        default="lraspp",
+        help="Internal semantic-cue implementation.",
+    )
+    parser.add_argument(
+        "--semantic-model-name",
+        type=str,
+        default="nvidia/segformer-b0-finetuned-ade-512-512",
+        help="Hugging Face SegFormer model ID or local model directory.",
+    )
+    parser.add_argument(
+        "--semantic-foreground-class-ids",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "SegFormer class IDs summed into foreground probability. "
+            "When omitted, IDs are inferred from label names."
+        ),
+    )
+    parser.add_argument(
+        "--semantic-foreground-labels",
+        nargs="+",
+        default=(
+            "person", "rider", "car", "truck", "bus", "train",
+            "motorcycle", "motorbike", "bicycle", "bike",
+        ),
+        help="SegFormer label names treated as foreground.",
+    )
+    parser.add_argument(
+        "--semantic-feed-size",
+        type=int,
+        nargs=2,
+        metavar=("HEIGHT", "WIDTH"),
+        default=(512, 512),
+        help="SegFormer inference resolution.",
+    )
+    parser.add_argument(
+        "--semantic-local-files-only",
+        action="store_true",
+        help="Load SegFormer only from a local path/cache.",
+    )
+
+    parser.add_argument(
         "--freeze-semantic",
         dest="freeze_semantic",
         action="store_true",
@@ -903,6 +948,21 @@ def validate_args(args: argparse.Namespace) -> None:
             "--depth-normalization-meters must be greater than zero."
         )
 
+    if min(args.semantic_feed_size) <= 0:
+        raise ValueError("--semantic-feed-size values must be positive.")
+    if not args.semantic_model_name.strip():
+        raise ValueError("--semantic-model-name cannot be empty.")
+    if args.semantic_provider == "segformer":
+        if args.semantic_map_mode != "foreground_probability":
+            raise ValueError(
+                "SegFormer requires --semantic-map-mode "
+                "foreground_probability."
+            )
+        if not args.freeze_semantic:
+            raise ValueError(
+                "A7 requires frozen SegFormer. Use --freeze-semantic."
+            )
+
     if (
         args.pose_loss_type == "mae"
         and args.translation_loss != "mse"
@@ -1032,12 +1092,12 @@ def validate_args(args: argparse.Namespace) -> None:
         if is_track_a_a4:
             if not args.pretrained_semantic:
                 raise ValueError(
-                    "Track-A A4 requires pretrained LR-ASPP."
+                    "Track-A cue experiments require pretrained semantics."
                 )
 
             if not args.freeze_semantic:
                 raise ValueError(
-                    "Track-A A4 requires frozen LR-ASPP. "
+                    "Track-A cue experiments require frozen semantics. "
                     "Use --freeze-semantic."
                 )
 
@@ -1637,6 +1697,16 @@ def build_model(
         normalize_semantic_input=True,
         normalize_semantic_map=True,
         semantic_map_mode=args.semantic_map_mode,
+        semantic_provider=args.semantic_provider,
+        semantic_model_name=args.semantic_model_name,
+        semantic_foreground_class_ids=(
+            None
+            if args.semantic_foreground_class_ids is None
+            else tuple(args.semantic_foreground_class_ids)
+        ),
+        semantic_foreground_labels=tuple(args.semantic_foreground_labels),
+        semantic_feed_size=tuple(args.semantic_feed_size),
+        semantic_local_files_only=args.semantic_local_files_only,
         share_aresunet_between_models=(
             args.share_aresunet_between_models
         ),
@@ -2295,10 +2365,28 @@ def save_checkpoint(
                 else None
             ),
             "semantic_model": (
-                "lraspp"
+                args.semantic_provider
                 if args.use_semantic_cues
                 else None
             ),
+            "semantic_provider": (
+                args.semantic_provider if args.use_semantic_cues else None
+            ),
+            "semantic_model_name": (
+                args.semantic_model_name if args.use_semantic_cues else None
+            ),
+            "semantic_foreground_class_ids": (
+                list(getattr(model, "semantic_foreground_class_ids", ()) or ())
+                if args.use_semantic_cues else None
+            ),
+            "semantic_foreground_labels": (
+                list(args.semantic_foreground_labels)
+                if args.use_semantic_cues else None
+            ),
+            "semantic_feed_size": (
+                list(args.semantic_feed_size) if args.use_semantic_cues else None
+            ),
+            "semantic_local_files_only": args.semantic_local_files_only,
 
             "semantic_map_mode": (
                 args.semantic_map_mode
@@ -2479,6 +2567,14 @@ def save_checkpoint(
                 args.freeze_semantic
             ),
             "semantic_map_mode": args.semantic_map_mode,
+            "semantic_provider": args.semantic_provider,
+            "semantic_model_name": args.semantic_model_name,
+            "semantic_foreground_class_ids": list(
+                getattr(model, "semantic_foreground_class_ids", ()) or ()
+            ),
+            "semantic_foreground_labels": list(args.semantic_foreground_labels),
+            "semantic_feed_size": list(args.semantic_feed_size),
+            "semantic_local_files_only": args.semantic_local_files_only,
 
             # Depth-cue configuration
             "use_depth_cues": (
@@ -2506,7 +2602,7 @@ def save_checkpoint(
             "depth_normalization_meters": (
                 args.depth_normalization_meters
             ),
-            "semantic_model": "lraspp",
+            "semantic_model": args.semantic_provider,
             "depth_provider": args.depth_provider,
             "depth_model": args.depth_provider,
             # Reproducibility
@@ -2639,6 +2735,7 @@ def print_run_summary(
         f"Semantic pretrained:  "
         f"{args.pretrained_semantic}"
     )
+    print(f"Semantic provider:    {args.semantic_provider}")
     print(
         f"Semantic frozen:      "
         f"{args.freeze_semantic}"
@@ -2843,8 +2940,19 @@ def print_run_summary(
     if args.use_semantic_cues:
         print(
             "Semantic auxiliary:   "
-            "LR-ASPP"
+            f"{args.semantic_provider.upper()}"
         )
+
+        if args.semantic_provider == "segformer":
+            print(f"Semantic model:       {args.semantic_model_name}")
+            print(
+                "Semantic feed size:   "
+                f"{args.semantic_feed_size[0]} x {args.semantic_feed_size[1]}"
+            )
+            print(
+                "Foreground IDs:       "
+                f"{getattr(model, 'semantic_foreground_class_ids', None)}"
+            )
 
         print(
             f"Semantic map mode:    "

@@ -40,6 +40,10 @@ from torch import Tensor
 from .auxiliary.lite_mono import LiteMonoDepthBranch
 from .auxiliary.monodepth2 import Monodepth2DepthBranch
 from .auxiliary.lraspp_fig2 import LRASPPSemanticBranch
+from .auxiliary.segformer import (
+    DEFAULT_FOREGROUND_LABELS,
+    SegFormerSemanticBranch,
+)
 from .blocks import AResUNet
 from .pose_head import (
     DirectionalTranslationHead,
@@ -111,6 +115,15 @@ class DeepDCTVO(nn.Module):
         normalize_semantic_input: bool = True,
         normalize_semantic_map: bool = True,
         semantic_map_mode: str = "foreground_probability",
+        semantic_provider: str = "lraspp",
+        semantic_model_name: str = (
+            "nvidia/segformer-b0-finetuned-ade-512-512"
+        ),
+        semantic_foreground_class_ids: Optional[Tuple[int, ...]] = None,
+        semantic_foreground_labels: Tuple[str, ...] = DEFAULT_FOREGROUND_LABELS,
+        semantic_feed_size: Optional[Tuple[int, int]] = None,
+        semantic_local_files_only: bool = False,
+        semantic_model: Optional[nn.Module] = None,
         share_aresunet_between_models: bool = False,
         rotation_pool_size: Tuple[int, int] = (8, 8),
 
@@ -174,6 +187,31 @@ class DeepDCTVO(nn.Module):
         self.semantic_map_mode = str(
             semantic_map_mode
         )
+
+        self.semantic_provider = str(semantic_provider).lower().replace("-", "_")
+        if self.semantic_provider not in {"lraspp", "segformer"}:
+            raise ValueError(
+                "semantic_provider must be 'lraspp' or 'segformer', "
+                f"but received {semantic_provider!r}."
+            )
+        if self.semantic_provider == "segformer" and self.semantic_map_mode != "foreground_probability":
+            raise ValueError(
+                "SegFormer supports only semantic_map_mode="
+                "'foreground_probability'."
+            )
+        self.semantic_model_name = str(semantic_model_name)
+        self.semantic_foreground_class_ids = (
+            None
+            if semantic_foreground_class_ids is None
+            else tuple(int(value) for value in semantic_foreground_class_ids)
+        )
+        self.semantic_foreground_labels = tuple(semantic_foreground_labels)
+        self.semantic_feed_size = (
+            None
+            if semantic_feed_size is None
+            else tuple(int(value) for value in semantic_feed_size)
+        )
+        self.semantic_local_files_only = bool(semantic_local_files_only)
 
         self.depth_provider = str(depth_provider).lower().replace("-", "_")
         if self.depth_provider not in {"lite_mono", "monodepth2"}:
@@ -274,13 +312,33 @@ class DeepDCTVO(nn.Module):
             translation_num_experts
         )
 
-        self.semantic_model = LRASPPSemanticBranch(
-            pretrained=pretrained_semantic,
-            freeze_pretrained=freeze_semantic,
-            normalize_input=normalize_semantic_input,
-            normalize_map=normalize_semantic_map,
-            semantic_map_mode=semantic_map_mode,
-        )
+        if semantic_model is not None:
+            self.semantic_model = semantic_model
+        elif self.semantic_provider == "lraspp":
+            self.semantic_model = LRASPPSemanticBranch(
+                pretrained=pretrained_semantic,
+                freeze_pretrained=freeze_semantic,
+                normalize_input=normalize_semantic_input,
+                normalize_map=normalize_semantic_map,
+                semantic_map_mode=semantic_map_mode,
+            )
+        else:
+            self.semantic_model = SegFormerSemanticBranch(
+                model_name_or_path=self.semantic_model_name,
+                foreground_class_ids=self.semantic_foreground_class_ids,
+                foreground_labels=self.semantic_foreground_labels,
+                feed_size=self.semantic_feed_size,
+                freeze_pretrained=freeze_semantic,
+                local_files_only=self.semantic_local_files_only,
+            )
+            self.semantic_foreground_class_ids = tuple(
+                self.semantic_model.foreground_class_ids
+            )
+
+        if self.freeze_semantic_model:
+            for parameter in self.semantic_model.parameters():
+                parameter.requires_grad = False
+            self.semantic_model.eval()
 
         if depth_model is not None:
             self.depth_model = depth_model
@@ -1104,5 +1162,3 @@ class DeepDCTVO(nn.Module):
             raise TypeError(
                 "semantic_curr and RGB input must have the same dtype."
             )
-
-

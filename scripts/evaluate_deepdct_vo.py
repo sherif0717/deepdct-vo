@@ -781,6 +781,41 @@ def resolve_evaluation_configuration(
             "foreground_probability",
         )
     )
+    semantic_provider = str(
+        configuration.get(
+            "semantic_provider",
+            configuration.get("semantic_model", "lraspp"),
+        )
+    ).lower().replace("-", "_")
+    if semantic_provider not in {"lraspp", "segformer"}:
+        raise ValueError(
+            f"Unsupported checkpoint semantic provider: {semantic_provider!r}."
+        )
+    semantic_model_name = str(
+        configuration.get(
+            "semantic_model_name",
+            "nvidia/segformer-b0-finetuned-ade-512-512",
+        )
+    )
+    semantic_foreground_class_ids = configuration.get(
+        "semantic_foreground_class_ids"
+    )
+    semantic_foreground_labels = tuple(
+        configuration.get(
+            "semantic_foreground_labels",
+            (
+                "person", "rider", "car", "truck", "bus", "train",
+                "motorcycle", "motorbike", "bicycle", "bike",
+            ),
+        )
+    )
+    semantic_feed_size = tuple(
+        int(value)
+        for value in configuration.get("semantic_feed_size", (512, 512))
+    )
+    semantic_local_files_only = bool(
+        configuration.get("semantic_local_files_only", False)
+    )
 
     share_aresunet = bool(
         configuration.get(
@@ -886,6 +921,16 @@ def resolve_evaluation_configuration(
         "pretrained_semantic": pretrained_semantic,
         "freeze_semantic": freeze_semantic,
         "semantic_map_mode": semantic_map_mode,
+        "semantic_provider": semantic_provider,
+        "semantic_model_name": semantic_model_name,
+        "semantic_foreground_class_ids": (
+            None
+            if semantic_foreground_class_ids is None
+            else tuple(int(value) for value in semantic_foreground_class_ids)
+        ),
+        "semantic_foreground_labels": semantic_foreground_labels,
+        "semantic_feed_size": semantic_feed_size,
+        "semantic_local_files_only": semantic_local_files_only,
         "share_aresunet_between_models": share_aresunet,
         "rotation_loss_weight": rotation_loss_weight,
         "translation_loss_weight": translation_loss_weight,
@@ -1116,6 +1161,24 @@ def build_model(
         semantic_map_mode=evaluation_configuration.get(
             "semantic_map_mode",
             "foreground_probability",
+        ),
+        semantic_provider=str(
+            evaluation_configuration["semantic_provider"]
+        ),
+        semantic_model_name=str(
+            evaluation_configuration["semantic_model_name"]
+        ),
+        semantic_foreground_class_ids=(
+            evaluation_configuration["semantic_foreground_class_ids"]
+        ),
+        semantic_foreground_labels=tuple(
+            evaluation_configuration["semantic_foreground_labels"]
+        ),
+        semantic_feed_size=tuple(
+            evaluation_configuration["semantic_feed_size"]
+        ),
+        semantic_local_files_only=bool(
+            evaluation_configuration["semantic_local_files_only"]
         ),
         use_depth_cues=bool(
             evaluation_configuration["use_depth_cues"]
@@ -3206,8 +3269,19 @@ def print_summary(
         ]
     ):
         print(
-            "Semantic auxiliary: LR-ASPP"
+            "Semantic auxiliary: "
+            f"{str(evaluation_configuration['semantic_provider']).upper()}"
         )
+
+        if evaluation_configuration["semantic_provider"] == "segformer":
+            print(
+                "Semantic model:     "
+                f"{evaluation_configuration['semantic_model_name']}"
+            )
+            print(
+                "Foreground IDs:     "
+                f"{evaluation_configuration['semantic_foreground_class_ids']}"
+            )
 
         print(
             "Semantic map mode: "
@@ -3676,6 +3750,11 @@ def main() -> None:
         f"Semantic cues:     "
         f"{bool(evaluation_configuration['use_semantic_cues'])}"
     )
+    if bool(evaluation_configuration["use_semantic_cues"]):
+        print(
+            "Semantic provider: "
+            f"{evaluation_configuration['semantic_provider']}"
+        )
 
     print(
         f"Depth cues:        "
