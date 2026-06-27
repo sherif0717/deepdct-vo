@@ -9,6 +9,9 @@ venv/
 # VSCode
 .vscode/
 
+# VS Code workspace
+deepdct-vo.code-workspace
+
 # PyCharm
 .idea/
 

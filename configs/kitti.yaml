@@ -1,0 +1,4 @@
+kitti:
+  root_dir: data/kitti
+  pose_dir: data/kitti/poses
+  label_dir: data/kitti/dct_labels

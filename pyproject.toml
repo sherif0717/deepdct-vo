@@ -1,0 +1,9 @@
+[project]
+name = "deepdct-vo"
+version = "0.1.0"
+description = "DeepDCT-VO reimplementation and testing scaffold"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

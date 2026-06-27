@@ -1,0 +1,4 @@
+model:
+  name: deepdct_vo
+  input_channels: 6
+  pose_dim: 6
