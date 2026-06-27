@@ -1,0 +1,37 @@
+# Bytecode
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+
+# VSCode
+.vscode/
+
+# PyCharm
+.idea/
+
+# Mac
+.DS_Store
+
+# Linux
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Outputs
+outputs/
+runs/
+logs/
+
+# Model checkpoints
+*.pth
+*.pt
+
+# Dataset
+data/
+
+# Cache
+.cache/
