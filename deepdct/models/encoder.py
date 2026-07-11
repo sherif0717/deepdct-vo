@@ -25,9 +25,10 @@ class EncoderBlock(nn.Module):
 
 
 class EncoderStage(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, return_attn=False):
         super().__init__()
 
+        self.return_attn = return_attn
         self.encoder = EncoderBlock(in_channels, out_channels)
         self.batch_norm = nn.BatchNorm2d(out_channels)
         self.attn = AttentionDownBlock(out_channels)
@@ -37,17 +38,21 @@ class EncoderStage(nn.Module):
         torch.nn.init.zeros_(self.batch_norm.bias)
 
     def forward(self, x):
-        x = self.encoder(x)      # Conv + ReLU
+        x = self.encoder(x)       # Conv + ReLU
 
-        skip = x                 # decoder skip: raw Conv+ReLU output
-        x_attn = x               # attention branch input
+        skip = x                  # raw Conv+ReLU skip
+        x_attn = x                # attention branch input
 
-        x_bn = self.batch_norm(x) # BN branch
-
+        x_bn = self.batch_norm(x)
         x_attn = self.attn(x_attn)
+
+        cache_x_attn = x_attn
 
         x = x_bn + x_attn
         x = self.pool(x)
+
+        if self.return_attn:
+            return x, skip, cache_x_attn
 
         return x, skip
     
@@ -56,13 +61,17 @@ class EncoderPath(nn.Module):
     def __init__(self, in_channels=4, base_channels=2):
         super().__init__()
 
-        self.enc1 = EncoderStage(in_channels, base_channels)          # 4 -> 2
-        self.enc2 = EncoderStage(base_channels, base_channels * 2)    # 2 -> 4
-        self.enc3 = EncoderStage(base_channels * 2, base_channels * 4) # 4 -> 8
+        self.enc1 = EncoderStage(in_channels, base_channels)
+        self.enc2 = EncoderStage(base_channels, base_channels * 2)
+        self.enc3 = EncoderStage(
+            base_channels * 2,
+            base_channels * 4,
+            return_attn=True,
+        )
 
     def forward(self, x):
-        x, skip1 = self.enc1(x)   # 120x120 -> 60x60
-        x, skip2 = self.enc2(x)   # 60x60 -> 30x30
-        x, skip3 = self.enc3(x)   # 30x30 -> 15x15
+        x, skip1 = self.enc1(x)                 # 120x120 -> 60x60
+        x, skip2 = self.enc2(x)                 # 60x60 -> 30x30
+        x, skip3, cache_x_attn = self.enc3(x)   # 30x30 -> 15x15
 
-        return x, (skip1, skip2, skip3)
+        return x, (skip1, skip2, skip3), cache_x_attn
