@@ -36,5 +36,8 @@ logs/
 # Dataset
 data/
 
+#Development notes
+development_order.txt
+
 # Cache
 .cache/

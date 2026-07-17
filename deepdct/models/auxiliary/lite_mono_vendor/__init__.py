@@ -1,0 +1,1 @@
+"""Vendored Lite-Mono implementation."""
