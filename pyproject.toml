@@ -1,8 +1,16 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "deepdct-vo"
 version = "0.1.0"
 description = "DeepDCT-VO reimplementation and testing scaffold"
-requires-python = ">=3.10"
+requires-python = ">=3.8"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["deepdct*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
