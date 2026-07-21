@@ -41,3 +41,11 @@ development_order.txt
 
 # Cache
 .cache/
+
+# Python package installation metadata
+*.egg-info/
+
+# Training and evaluation artifacts
+checkpoints/
+evaluation/
+experiments/
