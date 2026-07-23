@@ -1,0 +1,29 @@
+{
+  "experiment_name": "multisequence_baseline",
+  "train_sequences": [
+    "00",
+    "01",
+    "02",
+    "03",
+    "04",
+    "05",
+    "06",
+    "07",
+    "08"
+  ],
+  "validation_sequences": ["09"],
+  "test_sequences": ["10"],
+  "epochs": 15,
+  "batch_size": 1,
+  "num_workers": 0,
+  "evaluation_device": "cuda",
+  "data_root": "data",
+  "camera_directory": "image_2",
+  "sampler": "transition_uniform",
+  "target_normalization": "none",
+  "depth_source": "zero_placeholder",
+  "semantic_source": "pretrained_frozen_lraspp",
+  "train_extra_args": [],
+  "evaluation_extra_args": ["--skip-trajectory"],
+  "notes": "Unbalanced multi-sequence baseline using transition-uniform sampling."
+}

@@ -1,0 +1,19 @@
+{
+  "experiment_name": "single_sequence_baseline",
+  "train_sequences": ["00"],
+  "validation_sequences": ["09"],
+  "test_sequences": ["10"],
+  "epochs": 15,
+  "batch_size": 1,
+  "num_workers": 0,
+  "evaluation_device": "cuda",
+  "data_root": "data",
+  "camera_directory": "image_2",
+  "sampler": "transition_uniform",
+  "target_normalization": "none",
+  "depth_source": "zero_placeholder",
+  "semantic_source": "pretrained_frozen_lraspp",
+  "train_extra_args": [],
+  "evaluation_extra_args": ["--skip-trajectory"],
+  "notes": "Corrected tx ty tz rx ry rz target ordering. Sequence 00 training baseline."
+}
