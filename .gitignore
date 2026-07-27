@@ -49,3 +49,15 @@ development_order.txt
 checkpoints/
 evaluation/
 experiments/
+
+# Experiment-generated artifacts
+experiments/runs/
+experiments/results.csv
+
+# Keep experiment configurations versioned
+!experiments/
+!experiments/configs/
+!experiments/configs/*.json
+
+# Generated dataset analysis outputs
+analysis/

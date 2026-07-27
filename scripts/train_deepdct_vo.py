@@ -44,10 +44,15 @@ import torch
 import torch.nn as nn
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 
 from deepdct.data.training_dataset import DeepDCTTrainingDataset
 from deepdct.models.deepdct_vo import DeepDCTVO
+from deepdct.training.samplers import (
+    build_sequence_balanced_sampler,
+    summarize_sequence_distribution,
+)
+
 from deepdct.training.train_one_epoch import (
     EpochMetrics,
     train_one_epoch,
@@ -309,6 +314,31 @@ def parse_args() -> argparse.Namespace:
         save_every_epoch=True,
     )
 
+    parser.add_argument(
+        "--sampling-strategy",
+        choices=[
+            "transition_uniform",
+            "sequence_balanced",
+        ],
+        default="transition_uniform",
+        help=(
+            "Training sampling strategy. transition_uniform gives every "
+            "transition equal probability; sequence_balanced gives every "
+            "training sequence equal aggregate probability."
+        ),
+    )
+
+    parser.add_argument(
+        "--sampling-alpha",
+        type=float,
+        default=1.0,
+        help=(
+            "Inverse-frequency sequence-weighting exponent used when "
+            "--sampling-strategy sequence_balanced is selected. "
+            "Use 0.5 for tempered balancing and 1.0 for full balancing."
+        ),
+    )
+
     return parser.parse_args()
 
 
@@ -390,7 +420,13 @@ def validate_args(args: argparse.Namespace) -> None:
             "or:\n"
             "  --no-pretrained-semantic --no-freeze-semantic"
         )
-
+    
+    if not 0.0 <= args.sampling_alpha <= 1.0:
+        raise ValueError(
+            "--sampling-alpha must lie between 0.0 and 1.0."
+        )
+    
+    
 
 def seed_everything(seed: int) -> None:
     """Seed Python, NumPy, and PyTorch."""
@@ -429,18 +465,30 @@ def build_dataloader(
     dataset: DeepDCTTrainingDataset,
     args: argparse.Namespace,
     device: torch.device,
+    *,
     shuffle: bool,
+    sampler: Optional[Sampler[int]] = None,
 ) -> DataLoader:
     """Construct a training or validation DataLoader."""
+
+    if sampler is not None and shuffle:
+        raise ValueError(
+            "DataLoader cannot use both sampler and shuffle=True."
+        )
+
+    generator = torch.Generator()
+    generator.manual_seed(args.seed)
 
     return DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=shuffle,
+        sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
         drop_last=False,
         persistent_workers=args.num_workers > 0,
+        generator=generator,
     )
 
 
@@ -575,6 +623,8 @@ def save_checkpoint(
             "validation_sequences": list(
                 args.validation_sequences
             ),
+            "sampling_strategy": args.sampling_strategy,
+            "sampling_alpha": args.sampling_alpha,
             "camera": args.camera,
             "height": args.height,
             "width": args.width,
@@ -654,6 +704,10 @@ def print_run_summary(
         f"{args.height} x {args.width}"
     )
     print(f"Batch size:           {args.batch_size}")
+    print(
+    f"Sampling strategy:    "
+    f"{args.sampling_strategy}"
+    )
     print(f"Epochs:               {args.epochs}")
     print(
         f"Trainable parameters: "
@@ -749,11 +803,42 @@ def main() -> None:
         sequences=args.validation_sequences,
     )
 
+    training_sampler: Optional[Sampler[int]] = None
+
+    sequence_counts: Optional[Dict[str, int]] = None
+    sequence_probabilities: Optional[Dict[str, float]] = None
+
+    print(f"Batch size:           {args.batch_size}")
+    print(
+        f"Sampling strategy:    "
+        f"{args.sampling_strategy}"
+    )
+
+    if args.sampling_strategy == "sequence_balanced":
+        print(
+            f"Sampling alpha:       "
+            f"{args.sampling_alpha:.3f}"
+        )
+        (
+            training_sampler,
+            sequence_counts,
+            sequence_probabilities,
+        ) = build_sequence_balanced_sampler(
+            training_dataset,
+            alpha=args.sampling_alpha,
+            seed=args.seed,
+            num_samples=len(training_dataset),
+            replacement=True,
+        )
+
+    print(f"Epochs:               {args.epochs}")
+
     training_loader = build_dataloader(
         dataset=training_dataset,
         args=args,
         device=device,
-        shuffle=True,
+        shuffle=training_sampler is None,
+        sampler=training_sampler,
     )
 
     validation_loader = build_dataloader(
@@ -761,6 +846,7 @@ def main() -> None:
         args=args,
         device=device,
         shuffle=False,
+        sampler=None,
     )
 
     model = build_model(
@@ -828,6 +914,17 @@ def main() -> None:
         validation_dataset=validation_dataset,
         model=model,
     )
+
+    if (
+        sequence_counts is not None
+        and sequence_probabilities is not None
+    ):
+        print(
+            summarize_sequence_distribution(
+                sequence_counts,
+                sequence_probabilities,
+            )
+        )
 
     maximum_gradient_norm: Optional[float]
 
