@@ -36,6 +36,7 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from torch import Tensor
+from typing import Optional
 
 from .auxiliary.lite_mono import LiteMonoDepthBranch
 from .auxiliary.lraspp_fig2 import LRASPPSemanticBranch
@@ -93,6 +94,7 @@ class DeepDCTVO(nn.Module):
         freeze_semantic: bool = True,
         normalize_semantic_input: bool = True,
         normalize_semantic_map: bool = True,
+        semantic_map_mode: str = "foreground_probability",
         share_aresunet_between_models: bool = False,
             # Lite-Mono configuration
         depth_checkpoint_dir: Optional[PathLike] = (
@@ -103,9 +105,19 @@ class DeepDCTVO(nn.Module):
         freeze_depth: bool = True,
         depth_normalization_meters: float = 80.0,
         depth_model: Optional[nn.Module] = None,
+        use_semantic_cues: bool = False,
+        use_depth_cues: bool = False,
+        freeze_semantic_model: bool = True,
+        freeze_depth_model: bool = True,
+        depth_weights_dir: Optional[str] = None,
+        depth_output_mode: str = "normalized_depth",
     ) -> None:
         super().__init__()
 
+        self.use_semantic_cues = use_semantic_cues
+        self.use_depth_cues = use_depth_cues
+        self.freeze_semantic_model = freeze_semantic_model
+        self.freeze_depth_model = freeze_depth_model
         if aresunet_output_channels <= 0:
             raise ValueError(
                 "aresunet_output_channels must be positive, "
@@ -126,6 +138,7 @@ class DeepDCTVO(nn.Module):
             freeze_pretrained=freeze_semantic,
             normalize_input=normalize_semantic_input,
             normalize_map=normalize_semantic_map,
+            semantic_map_mode=semantic_map_mode,
         )
 
         if depth_model is not None:
@@ -177,6 +190,27 @@ class DeepDCTVO(nn.Module):
             input_size=self.input_size,
         )
 
+    def train(
+        self,
+        mode: bool = True,
+    ) -> "DeepDCTVO":
+        """Set training mode while keeping frozen auxiliaries in eval mode.
+
+        Calling ``model.train()`` recursively places all child modules in
+        training mode. Frozen semantic and depth models should remain in
+        evaluation mode so that BatchNorm statistics and dropout behavior
+        do not change during pose-network training.
+        """
+        super().train(mode)
+
+        if self.freeze_semantic_model:
+            self.semantic_model.eval()
+
+        if self.freeze_depth_model:
+            self.depth_model.eval()
+
+        return self
+
     def forward(
         self,
         image_prev: Tensor,
@@ -196,9 +230,12 @@ class DeepDCTVO(nn.Module):
                 Current RGB frame, shaped [B, 3, H, W].
 
             depth_curr:
-                Current one-channel depth map D_k, shaped [B, 1, H, W].
-                It should already be normalized according to the selected
-                depth pipeline.
+                Optional externally supplied one-channel depth map D_k,
+                shaped [B, 1, H, W]. It should already be normalized
+                according to the selected depth pipeline.
+
+                When supplied, this tensor takes precedence over the internal
+                depth model, regardless of ``self.use_depth_cues``.
 
             rotation_for_translation:
                 Optional [B, 3] rotation vector supplied to Model T.
@@ -209,8 +246,9 @@ class DeepDCTVO(nn.Module):
                 prediction.
 
             return_intermediates:
-                Include semantic maps, A-ResUNet inputs, feature maps, and
-                fusion tensors in the returned dictionary.
+                Include semantic maps, A-ResUNet inputs, feature maps, cue
+                state indicators, and fusion tensors in the returned
+                dictionary.
 
         Returns:
             Dictionary containing:
@@ -231,19 +269,59 @@ class DeepDCTVO(nn.Module):
             use_ground_truth_rotation=use_ground_truth_rotation,
         )
 
+        # ---------------------------------------------------------------
+        # Depth cue D_k
+        # ---------------------------------------------------------------
+        # An externally supplied depth tensor always takes precedence.
         depth_was_supplied = depth_curr is not None
 
         if depth_curr is None:
-            depth_curr = self.depth_model(image_curr)
+            if self.use_depth_cues:
+                if self.freeze_depth_model:
+                    with torch.no_grad():
+                        depth_curr = self.depth_model(image_curr)
+                else:
+                    depth_curr = self.depth_model(image_curr)
+            else:
+                # Preserve the expected one-channel fusion shape during
+                # depth-disabled ablation experiments.
+                depth_curr = torch.zeros_like(
+                    image_curr[:, :1]
+                )
 
         self._validate_depth(
             depth_curr=depth_curr,
             reference=image_curr,
         )
 
-        # Updated lraspp_fig2.py returns [B, 1, H, W] directly.
-        semantic_prev = self.semantic_model(image_prev)
-        semantic_curr = self.semantic_model(image_curr)
+        # ---------------------------------------------------------------
+        # Semantic cues S_(k-1) and S_k
+        # ---------------------------------------------------------------
+        if self.use_semantic_cues:
+            if self.freeze_semantic_model:
+                with torch.no_grad():
+                    semantic_prev = self.semantic_model(
+                        image_prev
+                    )
+                    semantic_curr = self.semantic_model(
+                        image_curr
+                    )
+            else:
+                semantic_prev = self.semantic_model(
+                    image_prev
+                )
+                semantic_curr = self.semantic_model(
+                    image_curr
+                )
+        else:
+            # Preserve the four-channel A-ResUNet input shape while
+            # performing a semantic-disabled ablation.
+            semantic_prev = torch.zeros_like(
+                image_prev[:, :1]
+            )
+            semantic_curr = torch.zeros_like(
+                image_curr[:, :1]
+            )
 
         self._validate_semantic_maps(
             semantic_prev=semantic_prev,
@@ -251,19 +329,54 @@ class DeepDCTVO(nn.Module):
             reference=image_curr,
         )
 
-        # Eq. (14)/(19): concatenate RGB and one-channel semantic map.
+        # ---------------------------------------------------------------
+        # RGB-semantic fusion
+        #
+        # Eq. (14)/(19):
+        #   CI_(k-1) = concat(I_(k-1), S_(k-1))
+        #   CI_k     = concat(I_k, S_k)
+        # ---------------------------------------------------------------
         ci_prev = torch.cat(
-            [image_prev, semantic_prev],
-            dim=1,
-        )
-        ci_curr = torch.cat(
-            [image_curr, semantic_curr],
+            [
+                image_prev,
+                semantic_prev,
+            ],
             dim=1,
         )
 
-        # Model R: same A-ResUNet weights are reused across timestamps.
-        c_prev_r = self.rotation_aresunet(ci_prev)
-        c_curr_r = self.rotation_aresunet(ci_curr)
+        ci_curr = torch.cat(
+            [
+                image_curr,
+                semantic_curr,
+            ],
+            dim=1,
+        )
+
+        if ci_prev.shape[1] != 4:
+            raise RuntimeError(
+                "Expected previous A-ResUNet input to have "
+                f"4 channels, but received {ci_prev.shape[1]}."
+            )
+
+        if ci_curr.shape[1] != 4:
+            raise RuntimeError(
+                "Expected current A-ResUNet input to have "
+                f"4 channels, but received {ci_curr.shape[1]}."
+            )
+
+        # ---------------------------------------------------------------
+        # Model R
+        #
+        # The same rotation-branch A-ResUNet weights are reused across
+        # timestamps.
+        # ---------------------------------------------------------------
+        c_prev_r = self.rotation_aresunet(
+            ci_prev
+        )
+
+        c_curr_r = self.rotation_aresunet(
+            ci_curr
+        )
 
         self._validate_aresunet_outputs(
             c_prev=c_prev_r,
@@ -271,6 +384,8 @@ class DeepDCTVO(nn.Module):
             branch_name="rotation",
         )
 
+        # Model R fusion:
+        #   [C_(k-1), C_k, S_k, D_k]
         rotation_features = torch.cat(
             [
                 c_prev_r,
@@ -285,7 +400,18 @@ class DeepDCTVO(nn.Module):
             rotation_features
         )
 
+        # ---------------------------------------------------------------
+        # Rotation conditioning for Model T
+        # ---------------------------------------------------------------
         if use_ground_truth_rotation:
+            # Validation in _validate_image_inputs() should guarantee
+            # that this is not None.
+            if rotation_for_translation is None:
+                raise RuntimeError(
+                    "rotation_for_translation must be supplied "
+                    "when use_ground_truth_rotation=True."
+                )
+
             rotation_used_for_translation = (
                 rotation_for_translation
             )
@@ -294,9 +420,19 @@ class DeepDCTVO(nn.Module):
                 predicted_rotation
             )
 
-        # Model T: same translation A-ResUNet is reused across time.
-        c_prev_t = self.translation_aresunet(ci_prev)
-        c_curr_t = self.translation_aresunet(ci_curr)
+        # ---------------------------------------------------------------
+        # Model T
+        #
+        # The same translation-branch A-ResUNet weights are reused across
+        # timestamps.
+        # ---------------------------------------------------------------
+        c_prev_t = self.translation_aresunet(
+            ci_prev
+        )
+
+        c_curr_t = self.translation_aresunet(
+            ci_curr
+        )
 
         self._validate_aresunet_outputs(
             c_prev=c_prev_t,
@@ -309,6 +445,8 @@ class DeepDCTVO(nn.Module):
             spatial_size=semantic_curr.shape[-2:],
         )
 
+        # Model T fusion:
+        #   [C_(k-1), C_k, S_k, D_k, R_k]
         translation_features = torch.cat(
             [
                 c_prev_t,
@@ -320,14 +458,20 @@ class DeepDCTVO(nn.Module):
             dim=1,
         )
 
-        directional_translation = self.translation_head(
-            translation_features
+        directional_translation = (
+            self.translation_head(
+                translation_features
+            )
         )
 
         outputs: ModelOutput = {
             "rotation": predicted_rotation,
-            "directional_translation": directional_translation,
-            "rotation_used_for_translation": rotation_used_for_translation,
+            "directional_translation": (
+                directional_translation
+            ),
+            "rotation_used_for_translation": (
+                rotation_used_for_translation
+            ),
         }
 
         if return_intermediates:
@@ -339,6 +483,27 @@ class DeepDCTVO(nn.Module):
                     "depth_was_supplied": torch.tensor(
                         depth_was_supplied,
                         device=image_curr.device,
+                        dtype=torch.bool,
+                    ),
+                    "semantic_cues_enabled": torch.tensor(
+                        self.use_semantic_cues,
+                        device=image_curr.device,
+                        dtype=torch.bool,
+                    ),
+                    "depth_cues_enabled": torch.tensor(
+                        self.use_depth_cues,
+                        device=image_curr.device,
+                        dtype=torch.bool,
+                    ),
+                    "semantic_model_frozen": torch.tensor(
+                        self.freeze_semantic_model,
+                        device=image_curr.device,
+                        dtype=torch.bool,
+                    ),
+                    "depth_model_frozen": torch.tensor(
+                        self.freeze_depth_model,
+                        device=image_curr.device,
+                        dtype=torch.bool,
                     ),
                     "ci_prev": ci_prev,
                     "ci_curr": ci_curr,
@@ -347,14 +512,43 @@ class DeepDCTVO(nn.Module):
                     "translation_c_prev": c_prev_t,
                     "translation_c_curr": c_curr_t,
                     "rotation_map": rotation_map,
-                    "rotation_features": rotation_features,
-                    "translation_features": translation_features,
+                    "rotation_features": (
+                        rotation_features
+                    ),
+                    "translation_features": (
+                        translation_features
+                    ),
                 }
             )
 
         return outputs
 
     
+    def _semantic_cue(self, image: torch.Tensor) -> torch.Tensor:
+        if not self.use_semantic_cues:
+            return torch.zeros_like(image[:, :1])
+
+        if self.freeze_semantic_model:
+            with torch.no_grad():
+                semantic = self.semantic_model(image)
+        else:
+            semantic = self.semantic_model(image)
+
+        return semantic
+
+
+    def _depth_cue(self, image: torch.Tensor) -> torch.Tensor:
+        if not self.use_depth_cues:
+            return torch.zeros_like(image[:, :1])
+
+        if self.freeze_depth_model:
+            with torch.no_grad():
+                depth = self.depth_model(image)
+        else:
+            depth = self.depth_model(image)
+
+        return depth
+
    
     @staticmethod
     def _validate_image_inputs(

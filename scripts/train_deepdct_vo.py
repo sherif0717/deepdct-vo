@@ -38,6 +38,7 @@ import random
 import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Union
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import numpy as np
 import torch
@@ -259,13 +260,6 @@ def parse_args() -> argparse.Namespace:
         help="Freeze the LR-ASPP semantic branch.",
     )
 
-    parser.add_argument(
-        "--no-freeze-semantic",
-        dest="freeze_semantic",
-        action="store_false",
-        help="Allow the LR-ASPP semantic branch to train.",
-    )
-
     parser.set_defaults(
         freeze_semantic=True,
     )
@@ -339,6 +333,206 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    parser.add_argument(
+        "--train-semantic-model",
+        action="store_true",
+        help="Allow semantic-model parameters to be updated.",
+    )
+
+    parser.add_argument(
+        "--train-depth-model",
+        action="store_true",
+        help="Allow depth-model parameters to be updated.",
+    )
+
+    parser.add_argument(
+        "--depth-weights-dir",
+        type=str,
+        default="weights/lite-mono-tiny-640x192",
+    )
+
+    parser.add_argument(
+        "--depth-checkpoint-dir",
+        type=Path,
+        default=Path(
+            "weights/lite-mono-tiny-640x192"
+        ),
+        help=(
+            "Directory containing the Lite-Mono encoder and decoder "
+            "checkpoint files."
+        ),
+    )
+
+    parser.add_argument(
+        "--depth-model-name",
+        type=str,
+        default="lite-mono-tiny",
+        choices=[
+            "lite-mono",
+            "lite-mono-small",
+            "lite-mono-tiny",
+            "lite-mono-8m",
+        ],
+        help="Lite-Mono architecture corresponding to the checkpoint.",
+    )
+
+    parser.add_argument(
+        "--depth-output-mode",
+        choices=(
+            "disparity",
+            "scaled_disparity",
+            "depth",
+            "normalized_depth",
+        ),
+        default="normalized_depth",
+    )
+
+    parser.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Load model weights from this checkpoint before training. "
+            "Optimizer, scheduler, epoch counter, and best-validation state "
+            "are not restored. Intended for warm-start experiments."
+        ),
+    )
+
+    parser.add_argument(
+        "--experiment-name",
+        type=str,
+        default="deepdct_vo",
+        help="Name recorded in checkpoints and training summaries.",
+    )
+
+    parser.add_argument(
+        "--source-experiment",
+        type=str,
+        default=None,
+        help=(
+            "Optional description of the experiment supplying the "
+            "warm-start checkpoint."
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Warm-start behavior
+    # ------------------------------------------------------------------
+
+    parser.add_argument(
+        "--strict-init-checkpoint",
+        dest="strict_init_checkpoint",
+        action="store_true",
+        help=(
+            "Require all checkpoint model parameters to match when using "
+            "--init-checkpoint."
+        ),
+    )
+
+    parser.add_argument(
+        "--no-strict-init-checkpoint",
+        dest="strict_init_checkpoint",
+        action="store_false",
+        help=(
+            "Allow missing or unexpected model parameters when using "
+            "--init-checkpoint."
+        ),
+    )
+
+    parser.set_defaults(
+        strict_init_checkpoint=True,
+    )
+
+    # ------------------------------------------------------------------
+    # Semantic cues
+    # ------------------------------------------------------------------
+
+    parser.add_argument(
+        "--use-semantic-cues",
+        dest="use_semantic_cues",
+        action="store_true",
+        help="Enable semantic cues in DeepDCT-VO.",
+    )
+
+    parser.add_argument(
+        "--no-use-semantic-cues",
+        dest="use_semantic_cues",
+        action="store_false",
+        help="Disable semantic cues in DeepDCT-VO.",
+    )
+
+    parser.set_defaults(
+        use_semantic_cues=False,
+    )
+
+    parser.set_defaults(
+        pretrained_semantic=True,
+    )
+
+    parser.add_argument(
+        "--no-freeze-semantic",
+        dest="freeze_semantic",
+        action="store_false",
+        help="Allow the semantic model to train.",
+    )
+
+    parser.set_defaults(
+        freeze_semantic=True,
+    )
+
+    # ------------------------------------------------------------------
+    # Depth cues
+    # ------------------------------------------------------------------
+
+    parser.add_argument(
+        "--use-depth-cues",
+        dest="use_depth_cues",
+        action="store_true",
+        help="Enable depth cues in DeepDCT-VO.",
+    )
+
+    parser.add_argument(
+        "--no-use-depth-cues",
+        dest="use_depth_cues",
+        action="store_false",
+        help="Disable depth cues in DeepDCT-VO.",
+    )
+
+    parser.set_defaults(
+        use_depth_cues=False,
+    )
+
+    parser.add_argument(
+        "--freeze-depth",
+        dest="freeze_depth",
+        action="store_true",
+        help="Freeze the depth model.",
+    )
+
+    parser.add_argument(
+        "--no-freeze-depth",
+        dest="freeze_depth",
+        action="store_false",
+        help="Allow the depth model to train.",
+    )
+
+    parser.set_defaults(
+        freeze_depth=True,
+    )
+
+    parser.add_argument(
+        "--semantic-map-mode",
+        choices=(
+            "foreground_probability",
+            "class_index",
+        ),
+        default="foreground_probability",
+        help=(
+            "One-channel representation generated from LR-ASPP logits. "
+            "'foreground_probability' uses 1 - P(background); "
+            "'class_index' preserves the legacy normalized argmax map."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -426,6 +620,14 @@ def validate_args(args: argparse.Namespace) -> None:
             "--sampling-alpha must lie between 0.0 and 1.0."
         )
     
+    if (
+        args.init_checkpoint is not None
+        and args.resume is not None
+    ):
+        raise ValueError(
+            "--init-checkpoint and --resume-checkpoint cannot be used together."
+        )
+    
     
 
 def seed_everything(seed: int) -> None:
@@ -496,7 +698,13 @@ def build_model(
     args: argparse.Namespace,
     device: torch.device,
 ) -> DeepDCTVO:
-    """Construct DeepDCTVO using the selected input resolution."""
+    """Construct DeepDCTVO using the selected cue configuration."""
+
+    depth_checkpoint_dir = (
+        str(args.depth_checkpoint_dir)
+        if args.use_depth_cues
+        else None
+    )
 
     model = DeepDCTVO(
         aresunet_output_channels=1,
@@ -505,14 +713,16 @@ def build_model(
         freeze_semantic=args.freeze_semantic,
         normalize_semantic_input=True,
         normalize_semantic_map=True,
+        semantic_map_mode=args.semantic_map_mode,
         share_aresunet_between_models=(
             args.share_aresunet_between_models
         ),
-        # The dataset currently supplies depth_curr, so Lite-Mono is
-        # bypassed during forward. Keep its checkpoint unset in this
-        # training scaffold.
-        depth_checkpoint_dir=None,
-        freeze_depth=True,
+        depth_checkpoint_dir=depth_checkpoint_dir,
+        depth_model_name=args.depth_model_name,
+        depth_output_mode=args.depth_output_mode,
+        freeze_depth=args.freeze_depth,
+        use_semantic_cues=args.use_semantic_cues,
+        use_depth_cues=args.use_depth_cues,
     )
 
     return model.to(device)
@@ -606,8 +816,49 @@ def save_checkpoint(
     validation_metrics: ValidationMetrics,
     best_validation_loss: float,
     args: argparse.Namespace,
+    warm_start_metadata: Optional[
+        Dict[str, Any]
+    ] = None,
 ) -> None:
     """Save complete resumable training state."""
+
+    warm_start_provenance: Dict[str, object] = {
+        "enabled": warm_start_metadata is not None,
+        "checkpoint_path": None,
+        "source_epoch": None,
+        "source_validation_loss": None,
+        "missing_keys": [],
+        "unexpected_keys": [],
+    }
+
+    if warm_start_metadata is not None:
+        warm_start_provenance.update(
+            {
+                "checkpoint_path": warm_start_metadata.get(
+                    "checkpoint_path"
+                ),
+                "source_epoch": warm_start_metadata.get(
+                    "source_epoch"
+                ),
+                "source_validation_loss": (
+                    warm_start_metadata.get(
+                        "source_validation_loss"
+                    )
+                ),
+                "missing_keys": list(
+                    warm_start_metadata.get(
+                        "missing_keys",
+                        [],
+                    )
+                ),
+                "unexpected_keys": list(
+                    warm_start_metadata.get(
+                        "unexpected_keys",
+                        [],
+                    )
+                ),
+            }
+        )
 
     checkpoint: Dict[str, object] = {
         "epoch": epoch,
@@ -617,18 +868,90 @@ def save_checkpoint(
         "training_metrics": training_metrics.as_dict(),
         "validation_metrics": validation_metrics.as_dict(),
         "best_validation_loss": best_validation_loss,
+
+        # ------------------------------------------------------------
+        # Experiment identity and provenance
+        # ------------------------------------------------------------
+        "experiment": {
+            "name": args.experiment_name,
+            "source_experiment": args.source_experiment,
+            "experiment_type": (
+                "warm_start_cue_adaptation"
+                if warm_start_metadata is not None
+                else "standard_training"
+            ),
+        },
+
+        "warm_start": warm_start_provenance,
+
+        "cue_config": {
+            "use_semantic_cues": (
+                args.use_semantic_cues
+            ),
+            "use_depth_cues": (
+                args.use_depth_cues
+            ),
+            "pretrained_semantic": (
+                args.pretrained_semantic
+            ),
+            "freeze_semantic": (
+                args.freeze_semantic
+            ),
+            "train_semantic_model": (
+                args.train_semantic_model
+            ),
+            "freeze_depth": (
+                args.freeze_depth
+            ),
+            "train_depth_model": (
+                args.train_depth_model
+            ),
+            "use_internal_depth": (
+                args.use_depth_cues
+            ),
+            "depth_checkpoint_dir": (
+                str(
+                    args.depth_checkpoint_dir.resolve()
+                )
+                if args.use_depth_cues
+                else None
+            ),
+            "depth_model_name": (
+                args.depth_model_name
+                if args.use_depth_cues
+                else None
+            ),
+            "depth_output_mode": (
+                args.depth_output_mode
+                if args.use_depth_cues
+                else None
+            ),
+        },
+
+        # ------------------------------------------------------------
+        # Complete resolved training configuration
+        # ------------------------------------------------------------
         "configuration": {
-            "data_root": str(args.data_root),
-            "train_sequences": list(args.train_sequences),
+            "data_root": str(
+                args.data_root.resolve()
+            ),
+            "train_sequences": list(
+                args.train_sequences
+            ),
             "validation_sequences": list(
                 args.validation_sequences
             ),
-            "sampling_strategy": args.sampling_strategy,
-            "sampling_alpha": args.sampling_alpha,
+            "sampling_strategy": (
+                args.sampling_strategy
+            ),
+            "sampling_alpha": (
+                args.sampling_alpha
+            ),
             "camera": args.camera,
             "height": args.height,
             "width": args.width,
             "batch_size": args.batch_size,
+            "epochs": args.epochs,
             "learning_rate": args.learning_rate,
             "weight_decay": args.weight_decay,
             "rotation_loss_weight": (
@@ -637,14 +960,64 @@ def save_checkpoint(
             "translation_loss_weight": (
                 args.translation_loss_weight
             ),
+            "max_grad_norm": (
+                args.max_grad_norm
+            ),
+            "scheduler_patience": (
+                args.scheduler_patience
+            ),
+            "scheduler_factor": (
+                args.scheduler_factor
+            ),
             "use_ground_truth_rotation": (
                 args.use_ground_truth_rotation
+            ),
+            "share_aresunet_between_models": (
+                args.share_aresunet_between_models
+            ),
+
+            # Semantic-cue configuration
+            "use_semantic_cues": (
+                args.use_semantic_cues
             ),
             "pretrained_semantic": (
                 args.pretrained_semantic
             ),
-            "freeze_semantic": args.freeze_semantic,
+            "freeze_semantic": (
+                args.freeze_semantic
+            ),
+            "semantic_map_mode": args.semantic_map_mode,
+
+            # Depth-cue configuration
+            "use_depth_cues": (
+                args.use_depth_cues
+            ),
+            "use_internal_depth": (
+                args.use_depth_cues
+            ),
+            "depth_checkpoint_dir": (
+                str(
+                    args.depth_checkpoint_dir.resolve()
+                )
+                if args.use_depth_cues
+                else None
+            ),
+            "depth_model_name": (
+                args.depth_model_name
+            ),
+            "depth_output_mode": (
+                args.depth_output_mode
+            ),
+            "freeze_depth": (
+                args.freeze_depth
+            ),
+
+            # Reproducibility
             "seed": args.seed,
+            "device": str(
+                next(model.parameters()).device
+            ),
+            "torch_version": torch.__version__,
         },
     }
 
@@ -671,8 +1044,29 @@ def print_run_summary(
     training_dataset: DeepDCTTrainingDataset,
     validation_dataset: DeepDCTTrainingDataset,
     model: nn.Module,
+    warm_start_metadata: Optional[
+        Mapping[str, Any]
+    ] = None,
 ) -> None:
     """Print the resolved training configuration."""
+
+    if warm_start_metadata is not None:
+        print(
+            f"Baseline epoch:       "
+            f"{warm_start_metadata.get('source_epoch')}"
+        )
+        print(
+            f"Baseline best val:    "
+            f"{warm_start_metadata.get('source_validation_loss')}"
+        )
+        print(
+            f"Checkpoint missing:   "
+            f"{len(warm_start_metadata.get('missing_keys', []))}"
+        )
+        print(
+            f"Checkpoint unexpected:"
+            f" {len(warm_start_metadata.get('unexpected_keys', []))}"
+        )
 
     trainable_parameters = sum(
         parameter.numel()
@@ -722,9 +1116,66 @@ def print_run_summary(
         f"Semantic frozen:      "
         f"{args.freeze_semantic}"
     )
+    print("=" * 72)
     print(
-        "Depth input:          zero placeholder supplied by dataset"
+        f"Experiment name:      "
+        f"{args.experiment_name}"
     )
+
+    print(
+        f"Source experiment:    "
+        f"{args.source_experiment}"
+    )
+
+    print(
+        f"Warm-start enabled:   "
+        f"{args.init_checkpoint is not None}"
+    )
+
+    if args.init_checkpoint is not None:
+        print(
+            f"Warm-start checkpoint:"
+            f" {args.init_checkpoint.expanduser().resolve()}"
+        )
+
+    print(
+        f"Semantic cues:        "
+        f"{args.use_semantic_cues}"
+    )
+
+    print(
+        f"Depth cues:           "
+        f"{args.use_depth_cues}"
+    )
+
+    print(
+        f"Semantic frozen:      "
+        f"{args.freeze_semantic}"
+    )
+
+    print(
+        f"Depth frozen:         "
+        f"{args.freeze_depth}"
+    )
+
+    if args.use_depth_cues:
+        print(
+            "Depth source:         "
+            "internal Lite-Mono"
+        )
+        print(
+            f"Depth checkpoint:     "
+            f"{args.depth_checkpoint_dir.expanduser().resolve()}"
+        )
+        print(
+            f"Depth output mode:    "
+            f"{args.depth_output_mode}"
+        )
+    else:
+        print(
+            "Depth source:         "
+            "dataset placeholder"
+        )
     print("=" * 72)
 
 
@@ -779,6 +1230,191 @@ def print_epoch_summary(
     print("-" * 72)
     print()
 
+def extract_model_state_dict(
+    checkpoint: Any,
+) -> Mapping[str, torch.Tensor]:
+    """Extract a model state dictionary from common checkpoint formats."""
+
+    if not isinstance(checkpoint, Mapping):
+        raise TypeError(
+            "Checkpoint must be a mapping, but received "
+            f"{type(checkpoint).__name__}."
+        )
+
+    candidate_keys = (
+        "model_state_dict",
+        "state_dict",
+        "model",
+        "network",
+    )
+
+    for key in candidate_keys:
+        candidate = checkpoint.get(key)
+
+        if isinstance(candidate, Mapping):
+            return candidate
+
+    # A raw state_dict is itself a mapping from parameter names to tensors.
+    if checkpoint and all(
+        isinstance(key, str)
+        and torch.is_tensor(value)
+        for key, value in checkpoint.items()
+    ):
+        return checkpoint
+
+    raise KeyError(
+        "Could not locate model weights in the checkpoint. "
+        f"Tried keys: {candidate_keys}."
+    )
+
+
+def remove_module_prefix(
+    state_dict: Mapping[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """Remove a DataParallel/DistributedDataParallel 'module.' prefix."""
+
+    if not state_dict:
+        return dict(state_dict)
+
+    if all(
+        key.startswith("module.")
+        for key in state_dict
+    ):
+        return {
+            key[len("module."):]: value
+            for key, value in state_dict.items()
+        }
+
+    return dict(state_dict)
+
+
+def load_warm_start_weights(
+    model: nn.Module,
+    checkpoint_path: Path,
+    device: torch.device,
+    *,
+    strict: bool = True,
+) -> Dict[str, Any]:
+    """Load model weights without restoring optimizer or epoch state."""
+
+    checkpoint_path = checkpoint_path.expanduser().resolve()
+
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"Warm-start checkpoint does not exist: {checkpoint_path}"
+        )
+
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=device,
+    )
+
+    state_dict = remove_module_prefix(
+        extract_model_state_dict(checkpoint)
+    )
+
+    # Inspect compatibility before committing the load.
+    incompatible = model.load_state_dict(
+        state_dict,
+        strict=False,
+    )
+
+    if strict:
+        if (
+            incompatible.missing_keys
+            or incompatible.unexpected_keys
+        ):
+            message = [
+                "",
+                "Warm-start checkpoint is incompatible with",
+                "the current DeepDCTVO architecture.",
+                "",
+            ]
+
+            if incompatible.missing_keys:
+                message.append("Missing parameters:")
+                message.extend(
+                    f"  {key}"
+                    for key in incompatible.missing_keys
+                )
+                message.append("")
+
+            if incompatible.unexpected_keys:
+                message.append("Unexpected parameters:")
+                message.extend(
+                    f"  {key}"
+                    for key in incompatible.unexpected_keys
+                )
+
+            raise RuntimeError(
+                "\n".join(message)
+            )
+        
+    # Perform the actual strict load once compatibility has been verified.
+    model.load_state_dict(
+        state_dict,
+        strict=strict,
+    )
+
+    metadata: Dict[str, Any] = {
+        "checkpoint_path": str(checkpoint_path),
+        "source_epoch": None,
+        "source_validation_loss": None,
+        "missing_keys": list(incompatible.missing_keys),
+        "unexpected_keys": list(incompatible.unexpected_keys),
+    }
+
+    if isinstance(checkpoint, Mapping):
+        metadata["source_epoch"] = checkpoint.get(
+            "epoch",
+            checkpoint.get("checkpoint_epoch"),
+        )
+
+        metadata["source_validation_loss"] = checkpoint.get(
+            "best_validation_loss",
+            checkpoint.get(
+                "validation_loss",
+                checkpoint.get("val_loss"),
+            ),
+        )
+
+    print("=" * 88)
+    print("Warm-start checkpoint loaded")
+    print("=" * 88)
+    print(
+        f"Checkpoint:              {metadata['checkpoint_path']}"
+    )
+    print(
+        f"Source epoch:            {metadata['source_epoch']}"
+    )
+    print(
+        "Source validation loss: "
+        f"{metadata['source_validation_loss']}"
+    )
+    print(
+        f"Strict loading:          {strict}"
+    )
+    print(
+        f"Missing keys:            "
+        f"{len(metadata['missing_keys'])}"
+    )
+    print(
+        f"Unexpected keys:         "
+        f"{len(metadata['unexpected_keys'])}"
+    )
+
+    if metadata["missing_keys"]:
+        for key in metadata["missing_keys"][:20]:
+            print(f"  missing:    {key}")
+
+    if metadata["unexpected_keys"]:
+        for key in metadata["unexpected_keys"][:20]:
+            print(f"  unexpected: {key}")
+
+    print("=" * 88)
+
+    return metadata
+
 
 def main() -> None:
     """Run multi-epoch training and validation."""
@@ -786,6 +1422,12 @@ def main() -> None:
     args = parse_args()
     validate_args(args)
     seed_everything(args.seed)
+
+    checkpoint_dir = Path(args.checkpoint_dir)
+    checkpoint_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     device = torch.device(
         "cuda"
@@ -854,9 +1496,31 @@ def main() -> None:
         device=device,
     )
 
-    optimizer = build_optimizer(
-        model=model,
-        args=args,
+    warm_start_metadata = None
+
+    if args.init_checkpoint is not None:
+        warm_start_metadata = load_warm_start_weights(
+            model=model,
+            checkpoint_path=args.init_checkpoint,
+            device=device,
+            strict=args.strict_init_checkpoint,
+        )
+
+    # Create the optimizer only after warm-start weights have been loaded.
+    trainable_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    ]
+
+    if not trainable_parameters:
+        raise RuntimeError(
+            "The model has no trainable parameters."
+        )
+
+    optimizer = torch.optim.Adam(
+        trainable_parameters,
+        lr=args.learning_rate,
     )
 
     scheduler = ReduceLROnPlateau(
@@ -913,6 +1577,7 @@ def main() -> None:
         training_dataset=training_dataset,
         validation_dataset=validation_dataset,
         model=model,
+        warm_start_metadata=warm_start_metadata,
     )
 
     if (
@@ -961,6 +1626,9 @@ def main() -> None:
             skip_nonfinite_batches=(
                 args.skip_nonfinite_batches
             ),
+            use_internal_depth=(
+                args.use_depth_cues
+            ),
         )
 
         validation_metrics = validate_one_epoch(
@@ -982,6 +1650,9 @@ def main() -> None:
             epoch_index=epoch,
             skip_nonfinite_batches=(
                 args.skip_nonfinite_batches
+            ),
+            use_internal_depth=(
+                args.use_depth_cues
             ),
         )
 
@@ -1026,6 +1697,7 @@ def main() -> None:
             validation_metrics=validation_metrics,
             best_validation_loss=best_validation_loss,
             args=args,
+            warm_start_metadata=warm_start_metadata,
         )
 
         if args.save_every_epoch:

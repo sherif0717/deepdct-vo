@@ -70,6 +70,23 @@ from torch.utils.data import DataLoader
 from deepdct.data.training_dataset import DeepDCTTrainingDataset
 from deepdct.models.deepdct_vo import DeepDCTVO
 
+import argparse
+import re
+from pathlib import Path
+from typing import Any, Dict, List, Mapping
+
+from deepdct.interpretability import (
+    FeatureMapCollector,
+    RegressionGradCAM,
+    collect_internal_attention_maps,
+    regression_target,
+)
+from deepdct.interpretability.visualization import (
+    save_channel_grid,
+    save_heatmap,
+    save_overlay,
+)
+
 
 @dataclass
 class AggregateMetrics:
@@ -307,6 +324,87 @@ def parse_args() -> argparse.Namespace:
         help="Interpret rotation labels and predictions as degrees.",
     )
 
+    parser.add_argument(
+        "--inspect-sample-index",
+        type=int,
+        default=0,
+        help="Dataset sample index to inspect.",
+    )
+
+    parser.add_argument(
+        "--inspection-output-dir",
+        type=Path,
+        default=Path("experiments/interpretability"),
+    )
+
+    parser.add_argument(
+        "--extract-attention",
+        action="store_true",
+        help="Save internal attention-gate coefficient maps.",
+    )
+
+    parser.add_argument(
+        "--extract-features",
+        action="store_true",
+        help="Save encoder/decoder feature maps.",
+    )
+
+    parser.add_argument(
+        "--feature-layers",
+        nargs="+",
+        default=[],
+        help=(
+            "Dotted module names whose outputs should be collected. "
+            "Run with --list-modules to discover names."
+        ),
+    )
+
+    parser.add_argument(
+        "--feature-reduction",
+        choices=["mean", "mean_abs", "max_abs", "l2"],
+        default="mean_abs",
+    )
+
+    parser.add_argument(
+        "--feature-max-channels",
+        type=int,
+        default=16,
+    )
+
+    parser.add_argument(
+        "--gradcam",
+        action="store_true",
+        help="Generate regression Grad-CAM.",
+    )
+
+    parser.add_argument(
+        "--gradcam-layer",
+        type=str,
+        default=None,
+        help="Dotted target convolution-layer path for Grad-CAM.",
+    )
+
+    parser.add_argument(
+        "--gradcam-target",
+        choices=[
+            "rotation_x",
+            "rotation_y",
+            "rotation_z",
+            "rotation_norm",
+            "translation_x",
+            "translation_y",
+            "translation_z",
+            "translation_norm",
+        ],
+        default="translation_norm",
+    )
+
+    parser.add_argument(
+        "--list-modules",
+        action="store_true",
+        help="Print model module names and exit.",
+    )
+
 
     args = parser.parse_args()
     if args.output_dir is None:
@@ -343,6 +441,26 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(
                 f"--{name.replace('_', '-')} cannot be negative."
             )
+        
+    if args.inspect_sample_index < 0:
+        raise ValueError(
+            "--inspect-sample-index cannot be negative."
+        )
+
+    if args.extract_features and not args.feature_layers:
+        raise ValueError(
+            "--extract-features requires --feature-layers."
+        )
+
+    if args.gradcam and not args.gradcam_layer:
+        raise ValueError(
+            "--gradcam requires --gradcam-layer."
+        )
+
+    if args.feature_max_channels <= 0:
+        raise ValueError(
+            "--feature-max-channels must be positive."
+        )
 
 
 def seed_everything(seed: int) -> None:
@@ -418,7 +536,6 @@ def get_checkpoint_configuration(
 
     return configuration
 
-
 def resolve_evaluation_configuration(
     args: argparse.Namespace,
     checkpoint: Mapping[str, object],
@@ -434,12 +551,16 @@ def resolve_evaluation_configuration(
     pretrained_semantic = bool(
         configuration.get("pretrained_semantic", True)
     )
+
     freeze_semantic = bool(
         configuration.get("freeze_semantic", True)
     )
 
-    semantic_map_mode = configuration.get(
-        "semantic_map_mode",
+    semantic_map_mode = str(
+        configuration.get(
+            "semantic_map_mode",
+            "foreground_probability",
+        )
     )
 
     share_aresunet = bool(
@@ -451,14 +572,20 @@ def resolve_evaluation_configuration(
 
     if args.rotation_loss_weight is None:
         rotation_loss_weight = float(
-            configuration.get("rotation_loss_weight", 1.0)
+            configuration.get(
+                "rotation_loss_weight",
+                1.0,
+            )
         )
     else:
         rotation_loss_weight = args.rotation_loss_weight
 
     if args.translation_loss_weight is None:
         translation_loss_weight = float(
-            configuration.get("translation_loss_weight", 1.0)
+            configuration.get(
+                "translation_loss_weight",
+                1.0,
+            )
         )
     else:
         translation_loss_weight = (
@@ -471,6 +598,7 @@ def resolve_evaluation_configuration(
         "camera": camera,
         "pretrained_semantic": pretrained_semantic,
         "freeze_semantic": freeze_semantic,
+        "semantic_map_mode": semantic_map_mode,
         "share_aresunet_between_models": share_aresunet,
         "rotation_loss_weight": rotation_loss_weight,
         "translation_loss_weight": translation_loss_weight,
@@ -480,26 +608,26 @@ def resolve_evaluation_configuration(
                 False,
             )
         ),
-
         "use_depth_cues": bool(
             configuration.get(
                 "use_depth_cues",
                 False,
             )
         ),
-
         "depth_checkpoint_dir": configuration.get(
             "depth_checkpoint_dir"
         ),
-
-        "depth_model_name": configuration.get(
-            "depth_model_name",
-            "lite-mono-tiny",
+        "depth_model_name": str(
+            configuration.get(
+                "depth_model_name",
+                "lite-mono-tiny",
+            )
         ),
-
-        "depth_output_mode": configuration.get(
-            "depth_output_mode",
-            "normalized_depth",
+        "depth_output_mode": str(
+            configuration.get(
+                "depth_output_mode",
+                "normalized_depth",
+            )
         ),
     }
 
@@ -647,6 +775,514 @@ def metadata_value(
     )
 
 
+def print_model_modules(model: nn.Module) -> None:
+    print("=" * 100)
+    print("DeepDCT-VO named modules")
+    print("=" * 100)
+
+    for name, module in model.named_modules():
+        if not name:
+            continue
+
+        print(f"{name:<70} {module.__class__.__name__}")
+
+def inspect_model_sample(
+    model: nn.Module,
+    dataloader: Iterable[Mapping[str, object]],
+    device: torch.device,
+    args: argparse.Namespace,
+    use_internal_depth: bool,
+) -> None:
+    """
+    Run interpretability methods on one dataset sample.
+
+    Supported analyses:
+        1. Internal attention-map extraction.
+        2. Encoder/decoder feature-map extraction.
+        3. Regression Grad-CAM.
+
+    The selected sample is controlled by:
+        args.inspect_sample_index
+
+    Notes
+    -----
+    - Interpretability is performed independently of full evaluation.
+    - Attention and feature extraction use a no-gradient forward pass.
+    - Grad-CAM uses a separate gradient-enabled forward pass.
+    - The function supports DataLoader batch sizes greater than one.
+    """
+
+    if not (
+        args.extract_attention
+        or args.extract_features
+        or args.gradcam
+    ):
+        return
+
+    if args.inspect_sample_index < 0:
+        raise ValueError(
+            "--inspect-sample-index cannot be negative."
+        )
+
+    if args.extract_features and not args.feature_layers:
+        raise ValueError(
+            "--extract-features requires at least one module name "
+            "through --feature-layers."
+        )
+
+    if args.gradcam and not args.gradcam_layer:
+        raise ValueError(
+            "--gradcam requires --gradcam-layer."
+        )
+
+    model.eval()
+
+    selected_batch: Optional[Mapping[str, object]] = None
+    selected_batch_offset: Optional[int] = None
+
+    dataset_offset = 0
+
+    # Locate the batch containing the requested dataset sample.
+    for batch in dataloader:
+        image_prev_batch = batch.get("image_prev")
+
+        if not torch.is_tensor(image_prev_batch):
+            raise TypeError(
+                "batch['image_prev'] must be a torch.Tensor."
+            )
+
+        current_batch_size = int(
+            image_prev_batch.shape[0]
+        )
+
+        batch_end_offset = (
+            dataset_offset + current_batch_size
+        )
+
+        if (
+            dataset_offset
+            <= args.inspect_sample_index
+            < batch_end_offset
+        ):
+            selected_batch = batch
+            selected_batch_offset = (
+                args.inspect_sample_index
+                - dataset_offset
+            )
+            break
+
+        dataset_offset = batch_end_offset
+
+    if (
+        selected_batch is None
+        or selected_batch_offset is None
+    ):
+        raise IndexError(
+            "Requested inspection sample index "
+            f"{args.inspect_sample_index} is outside the dataset."
+        )
+
+    sample_index = selected_batch_offset
+
+    def select_tensor(key: str) -> Tensor:
+        """
+        Select one sample from the located DataLoader batch and move it
+        to the evaluation device.
+        """
+
+        value = selected_batch.get(key)
+
+        if not torch.is_tensor(value):
+            raise TypeError(
+                f"batch[{key!r}] must be a torch.Tensor."
+            )
+
+        # Preserve the batch dimension.
+        return value[
+            sample_index : sample_index + 1
+        ].to(
+            device=device,
+            non_blocking=True,
+        )
+
+    image_prev = select_tensor("image_prev")
+    image_curr = select_tensor("image_curr")
+    rotation_gt = select_tensor("rotation_gt")
+
+    if use_internal_depth:
+        # DeepDCTVO internally invokes Lite-Mono.
+        depth_curr: Optional[Tensor] = None
+    else:
+        # Baseline checkpoints receive the dataset-provided placeholder.
+        depth_curr = select_tensor("depth_curr")
+
+    model_inputs: Dict[str, Any] = {
+        "image_prev": image_prev,
+        "image_curr": image_curr,
+        "depth_curr": depth_curr,
+        "rotation_for_translation": (
+            rotation_gt
+            if args.use_ground_truth_rotation
+            else None
+        ),
+        "use_ground_truth_rotation": (
+            args.use_ground_truth_rotation
+        ),
+    }
+
+    sample_output_dir = (
+        args.inspection_output_dir
+        / f"sequence_{args.sequence}"
+        / f"sample_{args.inspect_sample_index:06d}"
+    )
+
+    sample_output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    print()
+    print("=" * 72)
+    print("DeepDCT-VO sample inspection")
+    print("=" * 72)
+    print(
+        f"Dataset sample:     "
+        f"{args.inspect_sample_index}"
+    )
+
+    try:
+        frame_prev = metadata_value(
+            selected_batch,
+            "frame_prev",
+            sample_index,
+        )
+        frame_curr = metadata_value(
+            selected_batch,
+            "frame_curr",
+            sample_index,
+        )
+
+        print(f"Frame pair:         {frame_prev} -> {frame_curr}")
+    except (KeyError, TypeError, IndexError):
+        # Metadata is useful but not required for visualization.
+        pass
+
+    print(f"Attention maps:     {args.extract_attention}")
+    print(f"Feature maps:       {args.extract_features}")
+    print(f"Grad-CAM:           {args.gradcam}")
+    print(
+        f"Output directory:   "
+        f"{sample_output_dir.resolve()}"
+    )
+    print("=" * 72)
+
+    # ------------------------------------------------------------------
+    # 1. Internal attention maps and
+    # 2. Forward-hook feature maps
+    #
+    # These can share one no-gradient forward pass.
+    # ------------------------------------------------------------------
+
+    if args.extract_attention or args.extract_features:
+        feature_layers = (
+            list(args.feature_layers)
+            if args.extract_features
+            else []
+        )
+
+        with FeatureMapCollector(
+            model=model,
+            module_paths=feature_layers,
+            detach=True,
+            move_to_cpu=True,
+        ) as feature_collector:
+            with torch.no_grad():
+                inspection_outputs = model(**model_inputs)
+
+        if not isinstance(inspection_outputs, Mapping):
+            raise TypeError(
+                "DeepDCTVO must return a mapping for inspection."
+            )
+
+        # --------------------------------------------------------------
+        # 1. Save explicit internal attention coefficients.
+        # --------------------------------------------------------------
+
+        if args.extract_attention:
+            attention_maps = (
+                collect_internal_attention_maps(model)
+            )
+
+            if not attention_maps:
+                raise RuntimeError(
+                    "No internal attention maps were found. "
+                    "Verify that each attention module stores its "
+                    "sigmoid coefficient tensor in "
+                    "`self.last_attention_map`."
+                )
+
+            attention_output_dir = (
+                sample_output_dir
+                / "internal_attention"
+            )
+
+            attention_output_dir.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            for (
+                module_name,
+                attention_map,
+            ) in attention_maps.items():
+                safe_name = re.sub(
+                    r"[^a-zA-Z0-9_.-]+",
+                    "_",
+                    module_name,
+                )
+
+                save_heatmap(
+                    tensor=attention_map,
+                    output_path=(
+                        attention_output_dir
+                        / f"{safe_name}.png"
+                    ),
+                    title=(
+                        f"Internal attention\n"
+                        f"{module_name}"
+                    ),
+                )
+
+                save_overlay(
+                    image=image_curr,
+                    heatmap=attention_map,
+                    output_path=(
+                        attention_output_dir
+                        / f"{safe_name}_overlay.png"
+                    ),
+                    title=(
+                        f"Attention overlay\n"
+                        f"{module_name}"
+                    ),
+                )
+
+                attention_float = (
+                    attention_map.detach().float()
+                )
+
+                print(
+                    f"[attention] {module_name}: "
+                    f"shape={tuple(attention_float.shape)} "
+                    f"min={attention_float.min().item():.6f} "
+                    f"max={attention_float.max().item():.6f} "
+                    f"mean={attention_float.mean().item():.6f} "
+                    f"std={attention_float.std().item():.6f}"
+                )
+
+        # --------------------------------------------------------------
+        # 2. Save selected feature maps.
+        # --------------------------------------------------------------
+
+        if args.extract_features:
+            if not feature_collector.activations:
+                raise RuntimeError(
+                    "No feature maps were collected. Verify the "
+                    "module paths supplied through --feature-layers."
+                )
+
+            feature_output_dir = (
+                sample_output_dir
+                / "feature_maps"
+            )
+
+            feature_output_dir.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            for (
+                module_name,
+                feature_map,
+            ) in feature_collector.activations.items():
+                safe_name = re.sub(
+                    r"[^a-zA-Z0-9_.-]+",
+                    "_",
+                    module_name,
+                )
+
+                # save_heatmap() performs a mean-absolute channel
+                # reduction using the current visualization utility.
+                save_heatmap(
+                    tensor=feature_map,
+                    output_path=(
+                        feature_output_dir
+                        / f"{safe_name}_reduced.png"
+                    ),
+                    title=(
+                        f"Reduced feature activation\n"
+                        f"{module_name}"
+                    ),
+                )
+
+                save_channel_grid(
+                    feature_map=feature_map,
+                    output_path=(
+                        feature_output_dir
+                        / f"{safe_name}_channels.png"
+                    ),
+                    max_channels=(
+                        args.feature_max_channels
+                    ),
+                    title=(
+                        f"Feature channels\n"
+                        f"{module_name}"
+                    ),
+                )
+
+                feature_float = (
+                    feature_map.detach().float()
+                )
+
+                print(
+                    f"[feature] {module_name}: "
+                    f"shape={tuple(feature_float.shape)} "
+                    f"min={feature_float.min().item():.6f} "
+                    f"max={feature_float.max().item():.6f} "
+                    f"mean={feature_float.mean().item():.6f} "
+                    f"std={feature_float.std().item():.6f}"
+                )
+
+    # ------------------------------------------------------------------
+    # 3. Regression Grad-CAM
+    #
+    # This must run outside torch.no_grad() and torch.inference_mode().
+    # A separate forward pass is required.
+    # ------------------------------------------------------------------
+
+    if args.gradcam:
+        gradcam_output_dir = (
+            sample_output_dir
+            / "gradcam"
+        )
+
+        gradcam_output_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        gradcam_inputs: Dict[str, Any] = {}
+
+        for key, value in model_inputs.items():
+            if torch.is_tensor(value):
+                copied_value = value.detach().clone()
+
+                # Model parameters are frozen in build_model(). At least
+                # one floating-point input must therefore require
+                # gradients so that PyTorch constructs the computation
+                # graph needed by Grad-CAM.
+                if (
+                    key in {"image_prev", "image_curr"}
+                    and copied_value.is_floating_point()
+                ):
+                    copied_value.requires_grad_(True)
+
+                gradcam_inputs[key] = copied_value
+            else:
+                gradcam_inputs[key] = value
+
+        with RegressionGradCAM(
+            model=model,
+            target_layer=args.gradcam_layer,
+        ) as gradcam:
+            cam, gradcam_outputs = gradcam.generate(
+                model_inputs=gradcam_inputs,
+                target_function=(
+                    lambda outputs: regression_target(
+                        outputs=outputs,
+                        target=args.gradcam_target,
+                        sample_index=0,
+                    )
+                ),
+                output_size=(
+                    int(image_curr.shape[-2]),
+                    int(image_curr.shape[-1]),
+                ),
+            )
+
+        safe_layer_name = re.sub(
+            r"[^a-zA-Z0-9_.-]+",
+            "_",
+            args.gradcam_layer,
+        )
+
+        gradcam_stem = (
+            f"{safe_layer_name}_"
+            f"{args.gradcam_target}"
+        )
+
+        save_heatmap(
+            tensor=cam,
+            output_path=(
+                gradcam_output_dir
+                / f"{gradcam_stem}.png"
+            ),
+            title=(
+                f"Regression Grad-CAM\n"
+                f"Target: {args.gradcam_target}\n"
+                f"Layer: {args.gradcam_layer}"
+            ),
+        )
+
+        save_overlay(
+            image=image_curr,
+            heatmap=cam,
+            output_path=(
+                gradcam_output_dir
+                / f"{gradcam_stem}_overlay.png"
+            ),
+            title=(
+                f"Grad-CAM overlay: "
+                f"{args.gradcam_target}"
+            ),
+        )
+
+        cam_float = cam.detach().float()
+
+        print(
+            f"[gradcam] layer={args.gradcam_layer} "
+            f"target={args.gradcam_target} "
+            f"shape={tuple(cam_float.shape)} "
+            f"min={cam_float.min().item():.6f} "
+            f"max={cam_float.max().item():.6f} "
+            f"mean={cam_float.mean().item():.6f} "
+            f"std={cam_float.std().item():.6f}"
+        )
+
+        if isinstance(gradcam_outputs, Mapping):
+            rotation_output = gradcam_outputs.get(
+                "rotation"
+            )
+            translation_output = gradcam_outputs.get(
+                "directional_translation"
+            )
+
+            if torch.is_tensor(rotation_output):
+                print(
+                    "[gradcam] rotation prediction: "
+                    f"{rotation_output.detach().cpu().tolist()}"
+                )
+
+            if torch.is_tensor(translation_output):
+                print(
+                    "[gradcam] directional translation "
+                    "prediction: "
+                    f"{translation_output.detach().cpu().tolist()}"
+                )
+
+    print("=" * 72)
+    print("Sample inspection complete.")
+    print("=" * 72)
+
 def evaluate_model(
     model: nn.Module,
     dataloader: Iterable[Mapping[str, object]],
@@ -715,19 +1351,21 @@ def evaluate_model(
                     device,
                 )
 
-            outputs = model(
-                image_prev=image_prev,
-                image_curr=image_curr,
-                depth_curr=depth_curr,
-                rotation_for_translation=(
+            model_inputs = {
+                "image_prev": image_prev,
+                "image_curr": image_curr,
+                "depth_curr": depth_curr,
+                "rotation_for_translation": (
                     rotation_gt
                     if use_ground_truth_rotation
                     else None
                 ),
-                use_ground_truth_rotation=(
+                "use_ground_truth_rotation": (
                     use_ground_truth_rotation
                 ),
-            )
+            }
+
+            outputs = model(**model_inputs)
 
             rotation_pred = outputs["rotation"]
             translation_pred = outputs[
@@ -1800,6 +2438,19 @@ def main() -> None:
         exist_ok=True,
     )
 
+
+    model = build_model(
+        checkpoint=checkpoint,
+        evaluation_configuration=(
+            evaluation_configuration
+        ),
+        device=device,
+    )
+
+    if args.list_modules:
+        print_model_modules(model)
+        return
+    
     dataset = build_dataset(
         args=args,
         evaluation_configuration=(
@@ -1810,14 +2461,6 @@ def main() -> None:
     dataloader = build_dataloader(
         dataset=dataset,
         args=args,
-        device=device,
-    )
-
-    model = build_model(
-        checkpoint=checkpoint,
-        evaluation_configuration=(
-            evaluation_configuration
-        ),
         device=device,
     )
 
@@ -1857,6 +2500,16 @@ def main() -> None:
         f"{args.use_ground_truth_rotation}"
     )
     print("=" * 72)
+
+    inspect_model_sample(
+        model=model,
+        dataloader=dataloader,
+        device=device,
+        args=args,
+        use_internal_depth=bool(
+            evaluation_configuration["use_depth_cues"]
+        ),
+    )
 
     (
         aggregate_metrics,

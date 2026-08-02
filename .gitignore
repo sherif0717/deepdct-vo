@@ -61,3 +61,19 @@ experiments/results.csv
 
 # Generated dataset analysis outputs
 analysis/
+
+# Generated DeepDCT-VO experiment artifacts
+experiments/auxiliary_cue_smoke_test/
+experiments/auxiliary_cue_smoke_test_combined/
+experiments/baseline_rgb_only/
+experiments/interpretability/
+experiments/integrated_comparison_inputs/
+experiments/**/attention_maps/
+experiments/**/gradcam_maps/
+experiments/**/semantic_maps/
+experiments/**/depth_maps/
+experiments/**/*.pt
+experiments/**/*.pth
+experiments/**/*.png
+experiments/**/*.npy
+experiments/**/*.npz

@@ -99,6 +99,7 @@ def train_one_epoch(
     log_interval: Optional[int] = None,
     epoch_index: Optional[int] = None,
     skip_nonfinite_batches: bool = False,
+    use_internal_depth: bool = False,
 ) -> EpochMetrics:
     """Train ``model`` for one complete pass over ``dataloader``.
 
@@ -151,6 +152,12 @@ def train_one_epoch(
         When false, non-finite losses raise ``FloatingPointError``.
         When true, affected batches are skipped.
 
+    use_internal_depth:
+        When true, ignore any ``depth_curr`` tensor supplied by the
+        dataset and pass ``None`` to DeepDCTVO, causing the internal
+        Lite-Mono branch to generate depth. When false, use the
+        dataset-provided depth tensor when available.
+
     Returns
     -------
     EpochMetrics
@@ -200,12 +207,17 @@ def train_one_epoch(
         tensors = _prepare_batch(
             batch=batch,
             device=device,
+            include_depth=not use_internal_depth,
         )
 
         image_prev = tensors["image_prev"]
         image_curr = tensors["image_curr"]
         rotation_gt = tensors["rotation_gt"]
         translation_gt = tensors["translation_gt"]
+
+        # When use_internal_depth=True, _prepare_batch() intentionally
+        # omits depth_curr. Mapping.get() therefore returns None, which
+        # instructs DeepDCTVO to execute Lite-Mono internally.
         depth_curr = tensors.get("depth_curr")
 
         batch_size = image_prev.shape[0]
@@ -369,6 +381,8 @@ def train_one_epoch(
 def _prepare_batch(
     batch: Batch,
     device: torch.device,
+    *,
+    include_depth: bool = True,
 ) -> Dict[str, Tensor]:
     """Validate and move one DataLoader batch to ``device``."""
 
@@ -403,7 +417,7 @@ def _prepare_batch(
             non_blocking=True,
         )
 
-    if "depth_curr" in batch:
+    if include_depth and "depth_curr" in batch:
         depth_value = batch["depth_curr"]
 
         if not torch.is_tensor(depth_value):
@@ -414,7 +428,7 @@ def _prepare_batch(
 
         tensors["depth_curr"] = depth_value.to(
             device=device,
-            non_blocking=True,
+            non_blocking=device.type == "cuda",
         )
 
     _validate_batch_shapes(tensors)

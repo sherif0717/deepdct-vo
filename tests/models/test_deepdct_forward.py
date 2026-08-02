@@ -98,13 +98,18 @@ def model() -> DeepDCTVO:
         input_size=(120, 120),
         pretrained_semantic=False,
         freeze_semantic=True,
-        depth_model=DummyDepthBranch(),
-        share_aresunet_between_models=False,
+        normalize_semantic_input=True,
+        normalize_semantic_map=True,
+        use_semantic_cues=True,
+        use_depth_cues=True,
+        depth_checkpoint_dir=None,
+        freeze_depth=True,
     )
 
     network.semantic_model = DummySemanticBranch()
+    network.depth_model = DummyDepthBranch()
+    
     network.eval()
-
     return network
 
 
@@ -422,6 +427,10 @@ def test_internal_depth_model_is_used_when_depth_not_supplied(
 ):
     image_prev, image_curr, _ = inputs
 
+    model.use_depth_cues = True
+    model.depth_model = DummyDepthBranch()
+    model.eval()
+
     with torch.no_grad():
         outputs = model(
             image_prev=image_prev,
@@ -441,3 +450,24 @@ def test_internal_depth_model_is_used_when_depth_not_supplied(
     )
 
     assert outputs["depth_was_supplied"].item() is False
+
+
+def test_depth_placeholder_is_zero_when_depth_cues_disabled(
+    model,
+    inputs,
+):
+    image_prev, image_curr, _ = inputs
+
+    model.use_depth_cues = False
+
+    with torch.no_grad():
+        outputs = model(
+            image_prev=image_prev,
+            image_curr=image_curr,
+            depth_curr=None,
+            return_intermediates=True,
+        )
+
+    assert torch.count_nonzero(
+        outputs["depth_curr"]
+    ).item() == 0

@@ -16,6 +16,7 @@ def model() -> LRASPPSemanticBranch:
         freeze_pretrained=False,
         normalize_input=True,
         normalize_map=True,
+        semantic_map_mode="class_index",
         progress=False,
     )
 
@@ -101,9 +102,17 @@ def test_forward_labels_returns_integer_class_ids(
 
 
 def test_forward_all_returns_consistent_outputs(
-    model: LRASPPSemanticBranch,
     rgb_batch: torch.Tensor,
 ) -> None:
+    model = LRASPPSemanticBranch(
+        pretrained=False,
+        freeze_pretrained=False,
+        normalize_map=True,
+        semantic_map_mode="class_index",
+        progress=False,
+    )
+    model.eval()
+
     with torch.no_grad():
         outputs = model.forward_all(rgb_batch)
 
@@ -119,11 +128,24 @@ def test_forward_all_returns_consistent_outputs(
         keepdim=True,
     )
 
-    expected_map = expected_labels.to(rgb_batch.dtype)
-    expected_map = expected_map / float(model.num_classes - 1)
+    expected_map = expected_labels.to(
+        rgb_batch.dtype
+    )
 
-    assert torch.equal(outputs["labels"], expected_labels)
-    assert torch.allclose(outputs["semantic_map"], expected_map)
+    expected_map = (
+        expected_map
+        / float(model.num_classes - 1)
+    )
+
+    assert torch.equal(
+        outputs["labels"],
+        expected_labels,
+    )
+
+    assert torch.allclose(
+        outputs["semantic_map"],
+        expected_map,
+    )
 
 
 def test_forward_is_alias_of_forward_map(
@@ -144,15 +166,22 @@ def test_non_normalized_map_returns_float_class_ids(
         pretrained=False,
         freeze_pretrained=False,
         normalize_map=False,
+        semantic_map_mode="class_index",
         progress=False,
     )
     semantic_model.eval()
 
     with torch.no_grad():
-        labels = semantic_model.forward_labels(rgb_batch)
-        semantic_map = semantic_model.forward_map(rgb_batch)
+        labels = semantic_model.forward_labels(
+            rgb_batch
+        )
+
+        semantic_map = semantic_model.forward_map(
+            rgb_batch
+        )
 
     assert semantic_map.dtype == rgb_batch.dtype
+
     assert torch.equal(
         semantic_map,
         labels.to(rgb_batch.dtype),
@@ -308,3 +337,63 @@ def test_rejects_non_finite_input(
 
     with pytest.raises(ValueError):
         model(x)
+
+def test_foreground_probability_map_is_bounded(
+    rgb_batch: torch.Tensor,
+) -> None:
+    semantic_model = LRASPPSemanticBranch(
+        pretrained=False,
+        freeze_pretrained=False,
+        normalize_map=True,
+        semantic_map_mode="foreground_probability",
+        progress=False,
+    )
+    semantic_model.eval()
+
+    with torch.no_grad():
+        semantic_map = semantic_model.forward_map(
+            rgb_batch
+        )
+
+    assert semantic_map.shape == (
+        rgb_batch.shape[0],
+        1,
+        rgb_batch.shape[2],
+        rgb_batch.shape[3],
+    )
+
+    assert semantic_map.dtype == rgb_batch.dtype
+    assert torch.isfinite(semantic_map).all()
+    assert semantic_map.min().item() >= 0.0
+    assert semantic_map.max().item() <= 1.0
+
+def test_foreground_probability_matches_logits(
+    rgb_batch: torch.Tensor,
+) -> None:
+    semantic_model = LRASPPSemanticBranch(
+        pretrained=False,
+        freeze_pretrained=False,
+        normalize_map=True,
+        semantic_map_mode="foreground_probability",
+        progress=False,
+    )
+    semantic_model.eval()
+
+    with torch.no_grad():
+        outputs = semantic_model.forward_all(
+            rgb_batch
+        )
+
+    probabilities = torch.softmax(
+        outputs["logits"],
+        dim=1,
+    )
+
+    expected_map = 1.0 - probabilities[:, 0:1]
+
+    assert torch.allclose(
+        outputs["semantic_map"],
+        expected_map,
+        atol=1e-6,
+        rtol=1e-5,
+    )

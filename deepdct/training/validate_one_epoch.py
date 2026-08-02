@@ -73,6 +73,7 @@ def validate_one_epoch(
     log_interval: Optional[int] = None,
     epoch_index: Optional[int] = None,
     skip_nonfinite_batches: bool = False,
+    use_internal_depth: bool = False,
 ) -> ValidationMetrics:
     """Evaluate ``model`` for one complete pass over ``dataloader``.
 
@@ -154,6 +155,7 @@ def validate_one_epoch(
             tensors = _prepare_batch(
                 batch=batch,
                 device=device,
+                include_depth=not use_internal_depth,
             )
 
             image_prev = tensors["image_prev"]
@@ -290,8 +292,15 @@ def validate_one_epoch(
 def _prepare_batch(
     batch: Batch,
     device: torch.device,
+    *,
+    include_depth: bool = True,
 ) -> Dict[str, Tensor]:
-    """Validate and move one validation batch to ``device``."""
+    """Validate and move one validation batch to ``device``.
+
+    When ``include_depth`` is false, the dataset-provided depth tensor
+    is intentionally ignored. Passing no depth tensor to DeepDCTVO
+    allows the model's internal Lite-Mono branch to generate depth.
+    """
 
     required_keys = {
         "image_prev",
@@ -300,7 +309,9 @@ def _prepare_batch(
         "translation_gt",
     }
 
-    missing_keys = required_keys.difference(batch.keys())
+    missing_keys = required_keys.difference(
+        batch.keys()
+    )
 
     if missing_keys:
         raise KeyError(
@@ -321,10 +332,10 @@ def _prepare_batch(
 
         tensors[key] = value.to(
             device=device,
-            non_blocking=True,
+            non_blocking=device.type == "cuda",
         )
 
-    if "depth_curr" in batch:
+    if include_depth and "depth_curr" in batch:
         depth_value = batch["depth_curr"]
 
         if not torch.is_tensor(depth_value):
@@ -335,10 +346,12 @@ def _prepare_batch(
 
         tensors["depth_curr"] = depth_value.to(
             device=device,
-            non_blocking=True,
+            non_blocking=device.type == "cuda",
         )
 
-    _validate_batch_shapes(tensors)
+    _validate_batch_shapes(
+        tensors
+    )
 
     return tensors
 

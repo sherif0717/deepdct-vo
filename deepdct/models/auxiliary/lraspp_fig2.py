@@ -77,6 +77,8 @@ class LRASPPSemanticBranch(nn.Module):
         freeze_pretrained: bool = True,
         normalize_input: bool = True,
         normalize_map: bool = True,
+        semantic_map_mode: str = "foreground_probability",
+        background_class_id: int = 0,
         progress: bool = True,
     ) -> None:
         super().__init__()
@@ -84,6 +86,28 @@ class LRASPPSemanticBranch(nn.Module):
         self.freeze_pretrained = freeze_pretrained
         self.normalize_input = normalize_input
         self.normalize_map = normalize_map
+
+        valid_semantic_map_modes = {
+            "foreground_probability",
+            "confidence",
+            "class_index",
+        }
+
+        if semantic_map_mode not in valid_semantic_map_modes:
+            raise ValueError(
+                "semantic_map_mode must be one of "
+                f"{sorted(valid_semantic_map_modes)}, "
+                f"but received {semantic_map_mode!r}."
+            )
+
+        if background_class_id < 0:
+            raise ValueError(
+                "background_class_id must be non-negative, "
+                f"but received {background_class_id}."
+            )
+
+        self.semantic_map_mode = semantic_map_mode
+        self.background_class_id = background_class_id
 
         self.model = self._build_model(
             pretrained=pretrained,
@@ -95,6 +119,13 @@ class LRASPPSemanticBranch(nn.Module):
         self.num_classes = int(
             self.model.classifier.low_classifier.out_channels
         )
+
+        if self.background_class_id >= self.num_classes:
+            raise ValueError(
+                "background_class_id must be smaller than the number "
+                f"of LR-ASPP classes ({self.num_classes}), but received "
+                f"{self.background_class_id}."
+            )
 
         self.register_buffer(
             "image_mean",
@@ -240,27 +271,96 @@ class LRASPPSemanticBranch(nn.Module):
             dim=1,
             keepdim=True,
         )
+    
+    def logits_to_semantic_map(
+        self,
+        logits: Tensor,
+        output_dtype: torch.dtype,
+    ) -> Tensor:
+        """Convert LR-ASPP logits into the one-channel DeepDCT-VO cue.
 
-    def forward_map(self, x: Tensor) -> Tensor:
-        """Return the one-channel semantic map S_k used in Fig. 2.
+        Modes:
+            foreground_probability:
+                Return one minus the probability assigned to the background
+                class. This preserves soft semantic evidence and avoids treating
+                categorical class IDs as ordered scalar quantities.
 
-        The class-index map is converted to the input floating-point dtype.
-        By default, class IDs are normalized to [0, 1] before concatenation
-        with the corresponding RGB frame:
+            confidence:
+                Return the maximum class probability at each pixel.
 
-            CI_k = cat(I_k, S_k)
-
-        Argmax is intentionally non-differentiable because this branch is
-        intended to operate as a frozen pretrained map generator.
+            class_index:
+                Preserve the original normalized argmax class-index behavior for
+                backward-compatible experiments.
         """
-        labels = self.forward_labels(x)
-        semantic_map = labels.to(dtype=x.dtype)
+        if logits.ndim != 4:
+            raise ValueError(
+                "Expected semantic logits with shape [B, K, H, W], "
+                f"but received {tuple(logits.shape)}."
+            )
+
+        if self.semantic_map_mode == "foreground_probability":
+            probabilities = torch.softmax(
+                logits,
+                dim=1,
+            )
+
+            semantic_map = (
+                1.0
+                - probabilities[
+                    :,
+                    self.background_class_id : self.background_class_id + 1,
+                ]
+            )
+
+            return semantic_map.to(dtype=output_dtype)
+
+        if self.semantic_map_mode == "confidence":
+            probabilities = torch.softmax(
+                logits,
+                dim=1,
+            )
+
+            semantic_map = probabilities.max(
+                dim=1,
+                keepdim=True,
+            ).values
+
+            return semantic_map.to(dtype=output_dtype)
+
+        # Backward-compatible hard class-index cue.
+        labels = torch.argmax(
+            logits,
+            dim=1,
+            keepdim=True,
+        )
+
+        semantic_map = labels.to(dtype=output_dtype)
 
         if self.normalize_map:
-            denominator = float(max(self.num_classes - 1, 1))
+            denominator = float(
+                max(self.num_classes - 1, 1)
+            )
             semantic_map = semantic_map / denominator
 
         return semantic_map
+
+    def forward_map(self, x: Tensor) -> Tensor:
+        """Return the one-channel semantic cue used by DeepDCT-VO.
+
+        By default, the cue is foreground probability:
+
+            S_k = 1 - P(background | I_k)
+
+        This preserves soft semantic evidence even when background remains the
+        argmax class and avoids encoding categorical class IDs as ordered scalar
+        values.
+        """
+        logits = self.forward_logits(x)
+
+        return self.logits_to_semantic_map(
+            logits=logits,
+            output_dtype=x.dtype,
+        )
 
     def forward_all(self, x: Tensor) -> Dict[str, Tensor]:
         """Return logits, integer labels, and the normalized semantic map."""
@@ -272,11 +372,10 @@ class LRASPPSemanticBranch(nn.Module):
             keepdim=True,
         )
 
-        semantic_map = labels.to(dtype=x.dtype)
-
-        if self.normalize_map:
-            denominator = float(max(self.num_classes - 1, 1))
-            semantic_map = semantic_map / denominator
+        semantic_map = self.logits_to_semantic_map(
+            logits=logits,
+            output_dtype=x.dtype,
+        )
 
         return {
             "logits": logits,
