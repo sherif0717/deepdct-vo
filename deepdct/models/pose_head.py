@@ -125,12 +125,10 @@ class RegressionHead(nn.Module):
             bias=True,
         )
 
-        self.output_activation = nn.Identity()
-
-        # self.output_activation = nn.LeakyReLU(
-        #     negative_slope=negative_slope,
-        #     inplace=False,
-        # )
+        self.output_activation = nn.LeakyReLU(
+            negative_slope=negative_slope,
+            inplace=False,
+        )
 
     def forward(self, x: Tensor) -> Tensor:
         self._validate_input(x)
@@ -219,30 +217,22 @@ class RegressionHead(nn.Module):
                 "RegressionHead input contains NaN or infinite values."
             )
 
-
 class RotationHead(RegressionHead):
-    """Estimate relative roll, pitch, and yaw through a compact bottleneck.
+    """Estimate relative roll, pitch, and yaw.
 
-    Architecture
-    ------------
+    Paper-style architecture
+    ------------------------
     fusion tensor
         -> Conv2D(C -> 1)
         -> ReLU
         -> Dropout
-        -> AdaptiveAvgPool2d(PH, PW)
         -> Flatten
-        -> compact rotation representation z_R
-        -> Linear(D, 3)
+        -> Linear(H * W, 3)
+        -> LeakyReLU
         -> rotation
 
-    The compact representation is the exact representation consumed by
-    the final rotation readout, making it directly task-relevant.
-
-    With the recommended default pool_size=(8, 8):
-
-        representation_dim = 1 * 8 * 8 = 64
-
-    instead of the previous 120 * 120 = 14400 dimensions.
+    With the default input size of 120 x 120, the final dense layer
+    receives a 14400-dimensional flattened representation.
     """
 
     def __init__(
@@ -253,6 +243,12 @@ class RotationHead(RegressionHead):
         negative_slope: float = 0.01,
         pool_size: Tuple[int, int] = (8, 8),
     ) -> None:
+        """Initialize the paper-style rotation head.
+
+        ``pool_size`` is retained temporarily for constructor compatibility
+        with existing checkpoint/configuration code, but is intentionally
+        unused in the Track-A paper-reproduction path.
+        """
         super().__init__(
             in_channels=in_channels,
             input_size=input_size,
@@ -260,43 +256,23 @@ class RotationHead(RegressionHead):
             negative_slope=negative_slope,
         )
 
-        if (
-            len(pool_size) != 2
-            or pool_size[0] <= 0
-            or pool_size[1] <= 0
-        ):
-            raise ValueError(
-                "pool_size must contain two positive integers, "
-                f"but received {pool_size}."
-            )
-
+        # Retain the attribute so existing configuration/checkpoint
+        # inspection code does not fail, but do not apply pooling.
         self.pool_size = tuple(
             int(value)
             for value in pool_size
         )
 
-        self.pool = nn.AdaptiveAvgPool2d(
-            self.pool_size
-        )
-
-        # The inherited convolution produces one channel.
-        self.representation_dim = int(
-            self.pool_size[0]
-            * self.pool_size[1]
-        )
-
-        # Replace inherited Linear(14400, 3).
-        self.dense = nn.Linear(
-            in_features=self.representation_dim,
-            out_features=3,
-            bias=True,
+        self.representation_dim = (
+            self.input_size[0]
+            * self.input_size[1]
         )
 
     def extract_representation(
         self,
         x: Tensor,
     ) -> Tensor:
-        """Return compact task-relevant rotation representation z_R."""
+        """Return the flattened paper-style rotation representation."""
 
         self._validate_input(x)
 
@@ -311,8 +287,6 @@ class RotationHead(RegressionHead):
         x = self.conv(x)
         x = self.relu(x)
         x = self.dropout(x)
-
-        x = self.pool(x)
 
         representation = torch.flatten(
             x,
@@ -341,9 +315,11 @@ class RotationHead(RegressionHead):
         self,
         x: Tensor,
     ) -> Tuple[Tensor, Tensor]:
-        """Return both rotation prediction and compact representation."""
+        """Return rotation prediction and flattened representation."""
 
-        representation = self.extract_representation(x)
+        representation = self.extract_representation(
+            x
+        )
 
         rotation = self.dense(
             representation
@@ -359,6 +335,8 @@ class RotationHead(RegressionHead):
         self,
         x: Tensor,
     ) -> Tensor:
+        """Return only the rotation prediction."""
+
         rotation, _ = self.forward_with_representation(
             x
         )
@@ -368,11 +346,7 @@ class RotationHead(RegressionHead):
     def representation_input_module(
         self,
     ) -> nn.Module:
-        """Return final readout receiving compact z_R.
-
-        A forward-pre-hook on this module captures the exact compact
-        representation used to predict rotation.
-        """
+        """Return the final readout receiving the flattened representation."""
 
         return self.dense
 
@@ -732,7 +706,10 @@ class DirectionalTranslationHead(RegressionHead):
             self.last_gate_weights = None
             self.last_expert_predictions = None
 
-        self.output_activation = nn.Identity()
+            self.output_activation = nn.LeakyReLU(
+                negative_slope=negative_slope,
+                inplace=False,
+            )
 
     def forward(
         self,

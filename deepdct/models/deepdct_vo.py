@@ -520,7 +520,6 @@ class DeepDCTVO(nn.Module):
 
         outputs: ModelOutput = {
             "rotation": predicted_rotation,
-            "rotation_representation": rotation_representation,
             "directional_translation": (
                 directional_translation
             ),
@@ -532,6 +531,9 @@ class DeepDCTVO(nn.Module):
         if return_intermediates:
             outputs.update(
                 {
+                    "rotation_representation": (
+                        rotation_representation
+                    ),
                     "semantic_prev": semantic_prev,
                     "semantic_curr": semantic_curr,
                     "depth_curr": depth_curr,
