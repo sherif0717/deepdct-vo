@@ -30,6 +30,10 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from deepdct.training.rotation_geometry import (
+    RotationGeometryBank,
+)
+
 
 Batch = Mapping[str, Union[Tensor, str, int]]
 LossFunction = Callable[[Tensor, Tensor], Tensor]
@@ -42,18 +46,22 @@ class ValidationMetrics:
     total_loss: float
     rotation_loss: float
     translation_loss: float
+    rotation_geometry_loss: float
+
     num_batches: int
     num_samples: int
     elapsed_seconds: float
+
     skipped_batches: int = 0
 
     def as_dict(self) -> Dict[str, Union[float, int]]:
-        """Return metrics in a logging- and checkpoint-friendly form."""
-
         return {
             "total_loss": self.total_loss,
             "rotation_loss": self.rotation_loss,
             "translation_loss": self.translation_loss,
+            "rotation_geometry_loss": (
+                self.rotation_geometry_loss
+            ),
             "num_batches": self.num_batches,
             "num_samples": self.num_samples,
             "elapsed_seconds": self.elapsed_seconds,
@@ -69,6 +77,10 @@ def validate_one_epoch(
     translation_criterion: Optional[LossFunction] = None,
     rotation_loss_weight: float = 1.0,
     translation_loss_weight: float = 1.0,
+    rotation_geometry_weight: float = 0.0,
+    rotation_geometry_loss_fn: Optional[
+        RotationGeometryBank
+    ] = None,
     use_ground_truth_rotation: bool = False,
     log_interval: Optional[int] = None,
     epoch_index: Optional[int] = None,
@@ -93,14 +105,25 @@ def validate_one_epoch(
         Defaults to ``torch.nn.MSELoss()``.
 
     translation_criterion:
-        Loss function for predicted versus ground-truth directional
-        translation. Defaults to ``torch.nn.MSELoss()``.
+        Callable loss function for predicted versus ground-truth
+        directional translation. It must accept ``(prediction, target)``
+        and return a scalar tensor. Defaults to ``torch.nn.MSELoss()``.
 
     rotation_loss_weight:
         Scalar multiplier applied to the rotation loss.
 
     translation_loss_weight:
         Scalar multiplier applied to the directional-translation loss.
+
+    rotation_geometry_weight:
+        Scalar multiplier applied to the continuous SO(3)-supervised
+        rotation-representation geometry loss.
+
+    rotation_geometry_loss_fn:
+        RotationGeometryBank instance containing the frozen FIFO
+        memory-bank state used to evaluate rotation-representation
+        geometry. Validation queries this loss but must not update its
+        memory bank.
 
     use_ground_truth_rotation:
         When true, the ground-truth rotation target is passed to Model T
@@ -135,6 +158,7 @@ def validate_one_epoch(
     _validate_configuration(
         rotation_loss_weight=rotation_loss_weight,
         translation_loss_weight=translation_loss_weight,
+        rotation_geometry_weight=rotation_geometry_weight,
         log_interval=log_interval,
     )
 
@@ -143,6 +167,7 @@ def validate_one_epoch(
     running_total_loss = 0.0
     running_rotation_loss = 0.0
     running_translation_loss = 0.0
+    running_rotation_geometry_loss = 0.0
 
     processed_batches = 0
     processed_samples = 0
@@ -189,6 +214,10 @@ def validate_one_epoch(
                 "directional_translation"
             ]
 
+            rotation_representation = outputs[
+                "rotation_representation"
+            ]
+
             rotation_loss = rotation_criterion(
                 predicted_rotation,
                 rotation_gt,
@@ -209,9 +238,41 @@ def validate_one_epoch(
                 name="translation_loss",
             )
 
+            if rotation_geometry_weight > 0.0:
+                if rotation_geometry_loss_fn is None:
+                    raise RuntimeError(
+                        "rotation_geometry_weight > 0 requires "
+                        "rotation_geometry_loss_fn."
+                    )
+
+                rotation_geometry_loss = (
+                    rotation_geometry_loss_fn.geometry_loss(
+                        representation=rotation_representation,
+                        rotation_gt=rotation_gt,
+                    )
+                )
+
+                _validate_scalar_loss(
+                    loss=rotation_geometry_loss,
+                    name="rotation_geometry_loss",
+                )
+
+            else:
+                rotation_geometry_loss = (
+                    rotation_representation.sum() * 0.0
+                )
+
+            # --------------------------------------------------------------
+            # IMPORTANT:
+            # total_loss must be outside the geometry if/else so it is
+            # constructed for BOTH geometry-enabled and geometry-disabled
+            # validation.
+            # --------------------------------------------------------------
             total_loss = (
                 rotation_loss_weight * rotation_loss
                 + translation_loss_weight * translation_loss
+                + rotation_geometry_weight
+                * rotation_geometry_loss
             )
 
             if not torch.isfinite(total_loss):
@@ -220,7 +281,9 @@ def validate_one_epoch(
                     f"{batch_index}: "
                     f"rotation_loss={rotation_loss.detach().item()}, "
                     f"translation_loss="
-                    f"{translation_loss.detach().item()}."
+                    f"{translation_loss.detach().item()}, "
+                    f"rotation_geometry_loss="
+                    f"{rotation_geometry_loss.detach().item()}."
                 )
 
                 if skip_nonfinite_batches:
@@ -235,9 +298,13 @@ def validate_one_epoch(
             translation_loss_value = float(
                 translation_loss.detach().item()
             )
+            rotation_geometry_loss_value = float(
+                rotation_geometry_loss.detach().item()
+            )
             total_loss_value = float(
                 total_loss.detach().item()
             )
+
 
             running_rotation_loss += (
                 rotation_loss_value * batch_size
@@ -247,6 +314,10 @@ def validate_one_epoch(
             )
             running_total_loss += (
                 total_loss_value * batch_size
+            )
+            running_rotation_geometry_loss += (
+                rotation_geometry_loss_value
+                * batch_size
             )
 
             processed_batches += 1
@@ -264,6 +335,9 @@ def validate_one_epoch(
                     running_total_loss=running_total_loss,
                     running_rotation_loss=running_rotation_loss,
                     running_translation_loss=running_translation_loss,
+                    running_rotation_geometry_loss=(
+                        running_rotation_geometry_loss
+                    ),
                 )
 
     elapsed_seconds = time.perf_counter() - start_time
@@ -275,14 +349,23 @@ def validate_one_epoch(
         )
 
     return ValidationMetrics(
-        total_loss=running_total_loss / processed_samples,
+        total_loss=(
+            running_total_loss
+            / processed_samples
+        ),
         rotation_loss=(
-            running_rotation_loss / processed_samples
+            running_rotation_loss
+            / processed_samples
         ),
         translation_loss=(
-            running_translation_loss / processed_samples
+            running_translation_loss
+            / processed_samples
         ),
-        num_batches=processed_batches,
+        rotation_geometry_loss=(
+            running_rotation_geometry_loss
+            / processed_samples
+        ),
+                num_batches=processed_batches,
         num_samples=processed_samples,
         elapsed_seconds=elapsed_seconds,
         skipped_batches=skipped_batches,
@@ -500,6 +583,58 @@ def _validate_model_outputs(
             raise FloatingPointError(
                 f"outputs[{key!r}] contains NaN or infinity."
             )
+        
+    if "rotation_representation" not in outputs:
+        raise KeyError(
+            "Model output is missing required key: "
+            "'rotation_representation'."
+        )
+
+    rotation_representation = outputs[
+        "rotation_representation"
+    ]
+
+    if not torch.is_tensor(rotation_representation):
+        raise TypeError(
+            "outputs['rotation_representation'] "
+            "must be a torch.Tensor."
+        )
+
+    if rotation_representation.ndim != 2:
+        raise ValueError(
+            "outputs['rotation_representation'] must have "
+            "shape [B, D], but received "
+            f"{tuple(rotation_representation.shape)}."
+        )
+
+    if rotation_representation.shape[0] != batch_size:
+        raise ValueError(
+            "outputs['rotation_representation'] batch "
+            "dimension must match the validation batch: "
+            f"expected {batch_size}, received "
+            f"{rotation_representation.shape[0]}."
+        )
+
+    if rotation_representation.device != reference.device:
+        raise ValueError(
+            "outputs['rotation_representation'] is on "
+            f"{rotation_representation.device}, while the "
+            f"validation batch is on {reference.device}."
+        )
+
+    if not rotation_representation.is_floating_point():
+        raise TypeError(
+            "outputs['rotation_representation'] must be "
+            "floating point."
+        )
+
+    if not torch.isfinite(
+        rotation_representation
+    ).all():
+        raise FloatingPointError(
+            "outputs['rotation_representation'] contains "
+            "NaN or infinity."
+        )
 
 
 def _validate_scalar_loss(
@@ -528,6 +663,7 @@ def _validate_scalar_loss(
 def _validate_configuration(
     rotation_loss_weight: float,
     translation_loss_weight: float,
+    rotation_geometry_weight: float,
     log_interval: Optional[int],
 ) -> None:
     """Validate validation-loop configuration."""
@@ -537,6 +673,10 @@ def _validate_configuration(
         (
             "translation_loss_weight",
             translation_loss_weight,
+        ),
+        (
+            "rotation_geometry_weight",
+            rotation_geometry_weight,
         ),
     ):
         if not isinstance(value, (int, float)):
@@ -557,6 +697,7 @@ def _validate_configuration(
     if (
         rotation_loss_weight == 0
         and translation_loss_weight == 0
+        and rotation_geometry_weight == 0
     ):
         raise ValueError(
             "At least one loss weight must be positive."
@@ -582,6 +723,7 @@ def _print_progress(
     running_total_loss: float,
     running_rotation_loss: float,
     running_translation_loss: float,
+    running_rotation_geometry_loss: float,
 ) -> None:
     """Print sample-weighted running validation averages."""
 
@@ -600,7 +742,10 @@ def _print_progress(
     average_translation = (
         running_translation_loss / processed_samples
     )
-
+    average_rotation_geometry = (
+        running_rotation_geometry_loss
+        / processed_samples
+    )
     print(
         f"validation "
         f"epoch={epoch_label} "
@@ -609,5 +754,7 @@ def _print_progress(
         f"samples={processed_samples} "
         f"loss={average_total:.6f} "
         f"rotation_loss={average_rotation:.6f} "
-        f"translation_loss={average_translation:.6f}"
+        f"translation_loss={average_translation:.6f} "
+        f"rotation_geometry_loss="
+        f"{average_rotation_geometry:.6f}"
     )

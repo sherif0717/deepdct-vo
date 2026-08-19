@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "repository_root": ".",
+  "output_root": "experiments/integrated_comparison_inputs",
+  "common": {
+    "data_root": "data",
+    "sequence": "10",
+    "batch_size": 1,
+    "num_workers": 0,
+    "device": "cuda",
+    "seed": 42,
+    "translation_rotation_conditioning": "predicted",
+    "euler_order": "xyz",
+    "angles_in_degrees": false,
+    "attention_max_samples": ""
+  },
+  "models": {
+    "baseline": {
+      "checkpoint": "experiments/baseline_rgb_only/best_validation.pt",
+      "use_semantic_cues": false,
+      "use_depth_cues": false
+    },
+    "semantic_depth": {
+      "checkpoint": "experiments/semantic_depth/best_validation.pt",
+      "use_semantic_cues": true,
+      "use_depth_cues": true,
+      "semantic_map_mode": "foreground_probability",
+      "depth_model_name": "lite-mono-tiny",
+      "depth_output_mode": "normalized_depth",
+      "depth_checkpoint_dir": "weights/lite-mono-tiny-640x192",
+      "freeze_semantic": true,
+      "freeze_depth": true
+    }
+  },
+  "selection": {
+    "metric": "translation",
+    "categories": [
+      "lowest_baseline_error",
+      "median_baseline_error",
+      "highest_baseline_error",
+      "largest_semantic_depth_improvement",
+      "largest_semantic_depth_degradation",
+      "highest_ground_truth_rotation"
+    ]
+  },
+  "commands": {
+    "evaluate": [
+      "{python}",
+      "scripts/evaluate_deepdct_vo.py",
+      "--checkpoint",
+      "{checkpoint}",
+      "--data-root",
+      "{data_root}",
+      "--sequence",
+      "{sequence}",
+      "--output-dir",
+      "{output_dir}",
+      "--batch-size",
+      "{batch_size}",
+      "--num-workers",
+      "{num_workers}",
+      "--device",
+      "{device}",
+      "--seed",
+      "{seed}",
+      "--euler-order",
+      "xyz"
+    ],
+    "attention_statistics": [
+      "{python}",
+      "scripts/interpretability/analyze_attention_statistics.py",
+      "--checkpoint",
+      "{checkpoint}",
+      "--data-root",
+      "{data_root}",
+      "--sequence",
+      "{sequence}",
+      "--output-dir",
+      "{output_dir}",
+      "--batch-size",
+      "{batch_size}",
+      "--num-workers",
+      "{num_workers}",
+      "--device",
+      "{device}",
+      "--seed",
+      "{seed}"
+    ],
+    "visualize": [
+      "{python}",
+      "scripts/interpretability/inspect_deepdct_vo.py",
+      "--checkpoint", "{checkpoint}",
+      "--data-root", "{data_root}",
+      "--sequence", "{sequence}",
+      "--output-dir", "{evaluation_output_dir}",
+      "--inspection-output-dir", "{inspection_output_dir}",
+      "--batch-size", "{batch_size}",
+      "--num-workers", "{num_workers}",
+      "--device", "{device}",
+      "--seed", "{seed}",
+      "--inspect-sample-index", "{sample_index}",
+      "--extract-attention",
+      "--gradcam",
+      "--gradcam-layer", "{gradcam_layer}",
+      "--gradcam-target", "{gradcam_target}"
+    ]
+  }
+}

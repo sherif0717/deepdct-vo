@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "attention_layers": [
+    "rotation_aresunet.encoder.enc1.attn",
+    "rotation_aresunet.encoder.enc2.attn",
+    "rotation_aresunet.encoder.enc3.attn",
+    "rotation_aresunet.decoder.dec1.attn",
+    "rotation_aresunet.decoder.dec2.attn",
+    "rotation_aresunet.decoder.dec3.attn",
+    "translation_aresunet.encoder.enc1.attn",
+    "translation_aresunet.encoder.enc2.attn",
+    "translation_aresunet.encoder.enc3.attn",
+    "translation_aresunet.decoder.dec1.attn",
+    "translation_aresunet.decoder.dec2.attn",
+    "translation_aresunet.decoder.dec3.attn"
+  ],
+  "gradcam_targets": [
+    {
+      "name": "rotation_norm_dec3",
+      "branch": "rotation",
+      "layer": "rotation_aresunet.decoder.dec3.decoder.conv_t",
+      "target": "rotation_norm"
+    },
+    {
+      "name": "translation_norm_dec3",
+      "branch": "translation",
+      "layer": "translation_aresunet.decoder.dec3.decoder.conv_t",
+      "target": "translation_norm"
+    }
+  ]
+}

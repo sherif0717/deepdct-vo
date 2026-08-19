@@ -68,6 +68,7 @@ experiments/auxiliary_cue_smoke_test_combined/
 experiments/baseline_rgb_only/
 experiments/interpretability/
 experiments/integrated_comparison_inputs/
+experiments/deepdct_module_names.txt
 experiments/**/attention_maps/
 experiments/**/gradcam_maps/
 experiments/**/semantic_maps/

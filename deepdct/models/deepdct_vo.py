@@ -96,7 +96,14 @@ class DeepDCTVO(nn.Module):
         normalize_semantic_map: bool = True,
         semantic_map_mode: str = "foreground_probability",
         share_aresunet_between_models: bool = False,
-            # Lite-Mono configuration
+        rotation_pool_size: Tuple[int, int] = (8, 8),
+        translation_decoder_type: str = "dense",
+        translation_mlp_hidden_dims: Tuple[int, int] = (256, 64),
+        translation_projection_channels: int = 8,
+        translation_pool_size: Tuple[int, int] = (4, 4),
+        translation_aggregation_hidden_dim: int = 64,
+        translation_num_experts: int = 3,
+        # Lite-Mono configuration
         depth_checkpoint_dir: Optional[PathLike] = (
             "weights/lite-mono-tiny-640x192"
         ),
@@ -132,6 +139,35 @@ class DeepDCTVO(nn.Module):
 
         self.aresunet_output_channels = aresunet_output_channels
         self.input_size = tuple(input_size)
+
+        self.rotation_pool_size = tuple(
+            int(value)
+            for value in rotation_pool_size
+        )
+
+        self.translation_decoder_type = (
+            translation_decoder_type
+        )
+
+        self.translation_mlp_hidden_dims = tuple(
+            translation_mlp_hidden_dims
+        )
+
+        self.translation_projection_channels = int(
+            translation_projection_channels
+        )
+
+        self.translation_pool_size = tuple(
+            translation_pool_size
+        )
+
+        self.translation_aggregation_hidden_dim = int(
+            translation_aggregation_hidden_dim
+        )
+
+        self.translation_num_experts = int(
+            translation_num_experts
+        )
 
         self.semantic_model = LRASPPSemanticBranch(
             pretrained=pretrained_semantic,
@@ -183,11 +219,26 @@ class DeepDCTVO(nn.Module):
         self.rotation_head = RotationHead(
             in_channels=rotation_input_channels,
             input_size=self.input_size,
+            pool_size=self.rotation_pool_size,
         )
 
         self.translation_head = DirectionalTranslationHead(
             in_channels=translation_input_channels,
             input_size=self.input_size,
+            decoder_type=self.translation_decoder_type,
+            mlp_hidden_dims=self.translation_mlp_hidden_dims,
+            projection_channels=(
+                self.translation_projection_channels
+            ),
+            pool_size=(
+                self.translation_pool_size
+            ),
+            aggregation_hidden_dim=(
+                self.translation_aggregation_hidden_dim
+            ),
+            num_experts=(
+                self.translation_num_experts
+            ),
         )
 
     def train(
@@ -396,7 +447,10 @@ class DeepDCTVO(nn.Module):
             dim=1,
         )
 
-        predicted_rotation = self.rotation_head(
+        (
+            predicted_rotation,
+            rotation_representation,
+        ) = self.rotation_head.forward_with_representation(
             rotation_features
         )
 
@@ -466,6 +520,7 @@ class DeepDCTVO(nn.Module):
 
         outputs: ModelOutput = {
             "rotation": predicted_rotation,
+            "rotation_representation": rotation_representation,
             "directional_translation": (
                 directional_translation
             ),
@@ -520,6 +575,45 @@ class DeepDCTVO(nn.Module):
                     ),
                 }
             )
+
+            # -----------------------------------------------------------
+            # Translation conditioning diagnostics
+            #
+            # Only available for the gated-expert translation decoder.
+            # -----------------------------------------------------------
+            if (
+                self.translation_head.decoder_type
+                == "gated_expert"
+            ):
+                conditioning = (
+                    self.translation_head
+                    .conditioning_diagnostics()
+                )
+
+                outputs.update(
+                    {
+                        "translation_representation": (
+                            conditioning[
+                                "representation"
+                            ]
+                        ),
+                        "translation_gate_logits": (
+                            conditioning[
+                                "gate_logits"
+                            ]
+                        ),
+                        "translation_gate_weights": (
+                            conditioning[
+                                "gate_weights"
+                            ]
+                        ),
+                        "translation_expert_predictions": (
+                            conditioning[
+                                "expert_predictions"
+                            ]
+                        ),
+                    }
+                )
 
         return outputs
 
