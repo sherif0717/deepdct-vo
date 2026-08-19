@@ -1,0 +1,109 @@
+........................................................................ [ 30%]
+............................................F........................... [ 61%]
+....................................................................FF.. [ 91%]
+...................                                                      [100%]
+=================================== FAILURES ===================================
+________________ test_deepdct_vo_forward_returns_motion_vectors ________________
+
+model = DeepDCTVO(
+  (semantic_model): DummySemanticBranch()
+  (depth_model): DummyDepthBranch()
+  (rotation_aresunet): AResUN...lace=False)
+    (dense): Linear(in_features=14400, out_features=3, bias=True)
+    (output_activation): Identity()
+  )
+)
+inputs = (tensor([[[[0.6709, 0.1001, 0.0796,  ..., 0.6344, 0.4003, 0.1901],
+          [0.2229, 0.3083, 0.2095,  ..., 0.2591, 0....3, 0.8820, 0.9760,  ..., 0.4500, 0.3251, 0.6727],
+          [0.4861, 0.8990, 0.6653,  ..., 0.0825, 0.9203, 0.0306]]]]))
+
+    def test_deepdct_vo_forward_returns_motion_vectors(model, inputs):
+        image_prev, image_curr, depth_curr = inputs
+    
+        with torch.no_grad():
+            outputs = model(
+                image_prev=image_prev,
+                image_curr=image_curr,
+                depth_curr=depth_curr,
+            )
+    
+>       assert set(outputs) == {
+            "rotation",
+            "directional_translation",
+            "rotation_used_for_translation",
+        }
+E       AssertionError: assert {'directional..._translation'} == {'directional..._translation'}
+E         
+E         Extra items in the left set:
+E         'rotation_representation'
+E         Use -v to get more diff
+
+tests/models/test_deepdct_forward.py:155: AssertionError
+_____________________ test_dense_layers_have_three_outputs _____________________
+
+rotation_head = RotationHead(
+  (conv): Conv2d(4, 1, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+  (relu): ReLU(inplace=True)
+ ...ures=64, out_features=3, bias=True)
+  (output_activation): Identity()
+  (pool): AdaptiveAvgPool2d(output_size=(8, 8))
+)
+translation_head = DirectionalTranslationHead(
+  (conv): Conv2d(7, 1, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+  (relu): ReLU(i...0.2, inplace=False)
+  (dense): Linear(in_features=14400, out_features=3, bias=True)
+  (output_activation): Identity()
+)
+
+    def test_dense_layers_have_three_outputs(
+        rotation_head,
+        translation_head,
+    ):
+>       assert rotation_head.dense.in_features == 120 * 120
+E       assert 64 == (120 * 120)
+E        +  where 64 = Linear(in_features=64, out_features=3, bias=True).in_features
+E        +    where Linear(in_features=64, out_features=3, bias=True) = RotationHead(\n  (conv): Conv2d(4, 1, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))\n  (relu): ReLU(inplace=True)\n ...ures=64, out_features=3, bias=True)\n  (output_activation): Identity()\n  (pool): AdaptiveAvgPool2d(output_size=(8, 8))\n).dense
+
+tests/models/test_pose_head.py:166: AssertionError
+_________________ test_heads_use_leaky_relu_output_activation __________________
+
+rotation_head = RotationHead(
+  (conv): Conv2d(4, 1, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+  (relu): ReLU(inplace=True)
+ ...ures=64, out_features=3, bias=True)
+  (output_activation): Identity()
+  (pool): AdaptiveAvgPool2d(output_size=(8, 8))
+)
+translation_head = DirectionalTranslationHead(
+  (conv): Conv2d(7, 1, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+  (relu): ReLU(i...0.2, inplace=False)
+  (dense): Linear(in_features=14400, out_features=3, bias=True)
+  (output_activation): Identity()
+)
+
+    def test_heads_use_leaky_relu_output_activation(
+        rotation_head,
+        translation_head,
+    ):
+>       assert isinstance(
+            rotation_head.output_activation,
+            torch.nn.LeakyReLU,
+        )
+E       AssertionError: assert False
+E        +  where False = isinstance(Identity(), <class 'torch.nn.modules.activation.LeakyReLU'>)
+E        +    where Identity() = RotationHead(\n  (conv): Conv2d(4, 1, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))\n  (relu): ReLU(inplace=True)\n ...ures=64, out_features=3, bias=True)\n  (output_activation): Identity()\n  (pool): AdaptiveAvgPool2d(output_size=(8, 8))\n).output_activation
+E        +    and   <class 'torch.nn.modules.activation.LeakyReLU'> = <module 'torch.nn' from '/media/sherifdeen/ext_hd250/projects/deepdct-vo/.venv/lib/python3.8/site-packages/torch/nn/__init__.py'>.LeakyReLU
+E        +      where <module 'torch.nn' from '/media/sherifdeen/ext_hd250/projects/deepdct-vo/.venv/lib/python3.8/site-packages/torch/nn/__init__.py'> = torch.nn
+
+tests/models/test_pose_head.py:176: AssertionError
+=============================== warnings summary ===============================
+.venv/lib/python3.8/site-packages/timm/models/layers/__init__.py:49
+  /media/sherifdeen/ext_hd250/projects/deepdct-vo/.venv/lib/python3.8/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+    warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/models/test_deepdct_forward.py::test_deepdct_vo_forward_returns_motion_vectors
+FAILED tests/models/test_pose_head.py::test_dense_layers_have_three_outputs
+FAILED tests/models/test_pose_head.py::test_heads_use_leaky_relu_output_activation
+3 failed, 232 passed, 1 warning in 48.66s
