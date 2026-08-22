@@ -266,6 +266,7 @@ def train_one_epoch(
                 else None
             ),
             use_ground_truth_rotation=use_ground_truth_rotation,
+            return_intermediates=True,
         )
 
         _validate_model_outputs(

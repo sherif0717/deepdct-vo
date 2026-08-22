@@ -36,7 +36,6 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from torch import Tensor
-from typing import Optional
 
 from .auxiliary.lite_mono import LiteMonoDepthBranch
 from .auxiliary.lraspp_fig2 import LRASPPSemanticBranch
@@ -84,6 +83,22 @@ class DeepDCTVO(nn.Module):
             which is the closer interpretation of Fig. 2. If True, the same
             A-ResUNet is shared across both models as an experimental
             parameter-reduction variant.
+
+        rotation_normalization_scale:
+            Scale used to map the RotationHead regression output back to
+            physical Euler radians.
+
+            A value of 1.0 preserves the original A1 behavior.
+
+            For the A2 paper-reproduction experiment, use 0.175 so that:
+
+                rotation_normalized = rotation_gt / 0.175
+
+            during loss computation, while:
+
+                rotation_physical = rotation_normalized * 0.175
+
+            is supplied to Model T and downstream evaluation.
     """
 
     def __init__(
@@ -97,6 +112,14 @@ class DeepDCTVO(nn.Module):
         semantic_map_mode: str = "foreground_probability",
         share_aresunet_between_models: bool = False,
         rotation_pool_size: Tuple[int, int] = (8, 8),
+
+        # A2 paper-reproduction rotation normalization.
+        #
+        # 1.0   -> A1 behavior: RotationHead output is already physical radians.
+        # 0.175 -> A2 behavior: RotationHead learns normalized rotation;
+        #          physical rotation = normalized_prediction * 0.175.
+        rotation_normalization_scale: float = 1.0,
+
         translation_decoder_type: str = "dense",
         translation_mlp_hidden_dims: Tuple[int, int] = (256, 64),
         translation_projection_channels: int = 8,
@@ -143,6 +166,36 @@ class DeepDCTVO(nn.Module):
         self.rotation_pool_size = tuple(
             int(value)
             for value in rotation_pool_size
+        )
+
+        # ---------------------------------------------------------------
+        # Rotation normalization
+        # ---------------------------------------------------------------
+        #
+        # Model R's regression head operates in normalized rotation units.
+        # The value is converted back to physical Euler radians before it
+        # is exposed as outputs["rotation"] or supplied to Model T.
+        #
+        # A1:
+        #     rotation_normalization_scale = 1.0
+        #
+        # A2:
+        #     rotation_normalization_scale = 0.175
+        #
+        rotation_normalization_scale = float(
+            rotation_normalization_scale
+        )
+
+        if not (
+            rotation_normalization_scale > 0.0
+        ):
+            raise ValueError(
+                "rotation_normalization_scale must be greater than zero, "
+                f"but received {rotation_normalization_scale}."
+            )
+
+        self.rotation_normalization_scale = (
+            rotation_normalization_scale
         )
 
         self.translation_decoder_type = (
@@ -305,13 +358,24 @@ class DeepDCTVO(nn.Module):
             Dictionary containing:
 
                 rotation:
-                    Predicted rotation [B, 3].
+                    Predicted physical Euler rotation [B, 3].
+                    This remains in radians for downstream evaluation,
+                    trajectory reconstruction, and Model-T conditioning.
+
+                rotation_normalized:
+                    RotationHead regression output [B, 3] in normalized
+                    rotation units. For A2, physical rotation is obtained as:
+
+                        rotation = rotation_normalized * 0.175
+
+                    This tensor is intended for the paper-style normalized
+                    rotation loss.
 
                 directional_translation:
                     Predicted local directional translation [B, 3].
 
                 rotation_used_for_translation:
-                    Rotation actually supplied to Model T [B, 3].
+                    Physical rotation actually supplied to Model T [B, 3].
         """
         self._validate_image_inputs(
             image_prev=image_prev,
@@ -447,11 +511,41 @@ class DeepDCTVO(nn.Module):
             dim=1,
         )
 
+        # ---------------------------------------------------------------
+        # A2 rotation-output convention
+        #
+        # RotationHead predicts in normalized rotation units.
+        #
+        # A1:
+        #     scale = 1.0
+        #     normalized == physical radians
+        #
+        # A2:
+        #     scale = 0.175
+        #     physical radians = normalized * 0.175
+        #
+        # Keeping both representations is intentional:
+        #
+        #     predicted_rotation_normalized
+        #         -> used by the A2 rotation MAE objective
+        #
+        #     predicted_rotation
+        #         -> physical Euler radians
+        #         -> Model T conditioning
+        #         -> evaluation
+        #         -> CSV output
+        #         -> trajectory reconstruction
+        # ---------------------------------------------------------------
         (
-            predicted_rotation,
+            predicted_rotation_normalized,
             rotation_representation,
         ) = self.rotation_head.forward_with_representation(
             rotation_features
+        )
+
+        predicted_rotation = (
+            predicted_rotation_normalized
+            * self.rotation_normalization_scale
         )
 
         # ---------------------------------------------------------------
@@ -519,10 +613,27 @@ class DeepDCTVO(nn.Module):
         )
 
         outputs: ModelOutput = {
+            # Physical Euler rotation in radians.
+            #
+            # Keep this key backward-compatible because evaluation,
+            # trajectory reconstruction, diagnostics, and downstream
+            # scripts already interpret outputs["rotation"] as physical
+            # rotation.
             "rotation": predicted_rotation,
+
+            # Regression-space rotation used by the A2 paper-style
+            # normalized rotation loss.
+            "rotation_normalized": (
+                predicted_rotation_normalized
+            ),
+
             "directional_translation": (
                 directional_translation
             ),
+
+            # Always physical rotation units:
+            # - predicted radians during normal inference/training
+            # - supplied GT radians during A3-style GT conditioning
             "rotation_used_for_translation": (
                 rotation_used_for_translation
             ),
@@ -533,6 +644,9 @@ class DeepDCTVO(nn.Module):
                 {
                     "rotation_representation": (
                         rotation_representation
+                    ),
+                    "rotation_physical": (
+                        predicted_rotation
                     ),
                     "semantic_prev": semantic_prev,
                     "semantic_curr": semantic_curr,

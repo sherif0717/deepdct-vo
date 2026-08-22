@@ -236,6 +236,36 @@ def parse_args() -> argparse.Namespace:
         help="Weight applied to rotation loss.",
     )
 
+    # ------------------------------------------------------------------
+    # Track-A pose objective / rotation normalization
+    # ------------------------------------------------------------------
+
+    parser.add_argument(
+        "--pose-loss-type",
+        choices=[
+            "mse",
+            "mae",
+        ],
+        default="mse",
+        help=(
+            "Pose regression objective. "
+            "'mse' preserves the A1 baseline. "
+            "'mae' enables the paper-style A2 MAE objective for "
+            "both rotation and directional translation."
+        ),
+    )
+
+    parser.add_argument(
+        "--rotation-normalization-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Scale mapping the RotationHead regression output back to "
+            "physical Euler radians. "
+            "Use 1.0 for A1 and 0.175 for Track-A A2."
+        ),
+    )
+
     parser.add_argument(
         "--rotation-geometry-weight",
         type=float,
@@ -822,6 +852,43 @@ def validate_args(args: argparse.Namespace) -> None:
             "--rotation-loss-weight cannot be negative."
         )
 
+    if args.rotation_normalization_scale <= 0.0:
+        raise ValueError(
+            "--rotation-normalization-scale must be greater than zero."
+        )
+
+    if (
+        args.pose_loss_type == "mae"
+        and args.translation_loss != "mse"
+    ):
+        raise ValueError(
+            "--pose-loss-type mae is incompatible with "
+            "--translation-loss regime_balanced_mse. "
+            "Track-A A2 requires ordinary MAE for translation."
+        )
+
+    if args.pose_loss_type == "mae":
+        if args.rotation_geometry_weight != 0.0:
+            raise ValueError(
+                "Track-A A2 must not enable rotation geometry supervision."
+            )
+
+        if args.use_ground_truth_rotation:
+            raise ValueError(
+                "Track-A A2 must use predicted rotation for Model T. "
+                "Ground-truth rotation conditioning belongs to A3."
+            )
+
+        if args.translation_head_only:
+            raise ValueError(
+                "Track-A A2 must train the complete A1 pose model."
+            )
+
+        if args.rotation_readout_only:
+            raise ValueError(
+                "Track-A A2 must not use rotation-readout-only training."
+            )
+
     if args.translation_loss_weight < 0:
         raise ValueError(
             "--translation-loss-weight cannot be negative."
@@ -1325,6 +1392,9 @@ def build_model(
         ),
         rotation_pool_size=tuple(
             args.rotation_pool_size
+        ),
+        rotation_normalization_scale=(
+            args.rotation_normalization_scale
         ),
         translation_decoder_type=(
             args.translation_decoder
@@ -1938,6 +2008,24 @@ def save_checkpoint(
             "rotation_loss_weight": (
                 args.rotation_loss_weight
             ),
+            # ------------------------------------------------------------
+            # Track-A pose-loss / rotation-normalization configuration.
+            #
+            # A1:
+            #     scale = 1.0
+            #     pose_loss_type = "mse"
+            #
+            # A2:
+            #     scale = 0.175
+            #     pose_loss_type = "mae"
+            # ------------------------------------------------------------
+            "rotation_normalization_scale": (
+                args.rotation_normalization_scale
+            ),
+
+            "pose_loss_type": (
+                args.pose_loss_type
+            ),
             "translation_loss_weight": (
                 args.translation_loss_weight
             ),
@@ -2190,6 +2278,16 @@ def print_run_summary(
     print(
         f"Rotation geometry wt:  "
         f"{args.rotation_geometry_weight}"
+    )
+
+    print(
+        f"Pose loss type:        "
+        f"{args.pose_loss_type.upper()}"
+    )
+
+    print(
+        f"Rotation norm scale:   "
+        f"{args.rotation_normalization_scale:.6f}"
     )
 
     if args.rotation_geometry_weight > 0.0:
@@ -3306,28 +3404,59 @@ def main() -> None:
         patience=args.scheduler_patience,
     )
 
-    rotation_criterion = nn.MSELoss()
-
-    if args.translation_loss == "mse":
-        translation_criterion = nn.MSELoss()
-
-    elif args.translation_loss == "regime_balanced_mse":
-        if translation_regime_configuration is None:
+    # --------------------------------------------------------------
+    # Pose regression objective
+    #
+    # A1:
+    #     pose_loss_type = "mse"
+    #
+    # A2:
+    #     pose_loss_type = "mae"
+    #
+    # A2 uses the same MAE/L1 objective for:
+    #     - normalized rotation
+    #     - directional translation
+    # --------------------------------------------------------------
+    if args.pose_loss_type == "mae":
+        if args.translation_loss != "mse":
             raise RuntimeError(
-                "Regime-balanced translation loss was selected, "
-                "but no regime configuration was constructed."
+                "Track-A MAE pose loss requires ordinary translation "
+                "loss configuration; regime-balanced MSE cannot be "
+                "combined with --pose-loss-type mae."
             )
 
-        translation_criterion = (
-            RegimeBalancedTranslationMSE(
-                translation_regime_configuration
+        rotation_criterion = nn.L1Loss()
+        translation_criterion = nn.L1Loss()
+
+    elif args.pose_loss_type == "mse":
+        rotation_criterion = nn.MSELoss()
+
+        if args.translation_loss == "mse":
+            translation_criterion = nn.MSELoss()
+
+        elif args.translation_loss == "regime_balanced_mse":
+            if translation_regime_configuration is None:
+                raise RuntimeError(
+                    "Regime-balanced translation loss was selected, "
+                    "but no regime configuration was constructed."
+                )
+
+            translation_criterion = (
+                RegimeBalancedTranslationMSE(
+                    translation_regime_configuration
+                )
             )
-        )
+
+        else:
+            raise RuntimeError(
+                "Unsupported translation loss: "
+                f"{args.translation_loss!r}."
+            )
 
     else:
         raise RuntimeError(
-            "Unsupported translation loss: "
-            f"{args.translation_loss!r}."
+            "Unsupported pose loss type: "
+            f"{args.pose_loss_type!r}."
         )
 
     args.checkpoint_dir.mkdir(

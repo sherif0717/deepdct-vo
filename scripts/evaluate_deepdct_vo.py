@@ -75,6 +75,26 @@ from deepdct.models.deepdct_vo import DeepDCTVO
 class AggregateMetrics:
     """Aggregate frame-level pose-regression metrics."""
 
+    # ----------------------------------------------------------
+    # Training-objective-compatible evaluation loss.
+    #
+    # A1:
+    #     MSE(raw rotation, raw GT)
+    #     + MSE(translation, translation GT)
+    #
+    # A2:
+    #     MAE(normalized rotation, normalized rotation GT)
+    #     + MAE(translation, translation GT)
+    #
+    # These fields are used when comparing the held-out test
+    # result against the validation loss stored in the checkpoint.
+    # ----------------------------------------------------------
+    objective_name: str
+    total_objective_loss: float
+    rotation_objective_loss: float
+    translation_objective_loss: float
+
+    # Physical-unit diagnostic metrics.
     total_mse: float
     rotation_mse: float
     translation_mse: float
@@ -465,6 +485,43 @@ def resolve_evaluation_configuration(
         configuration.get("freeze_semantic", True)
     )
 
+    # --------------------------------------------------------------
+    # Pose-loss / rotation-normalization configuration.
+    #
+    # Backward compatibility:
+    #     old/A1 checkpoints -> scale 1.0, MSE
+    #
+    # A2 checkpoints should record:
+    #     rotation_normalization_scale = 0.175
+    #     pose_loss_type = "mae"
+    # --------------------------------------------------------------
+    rotation_normalization_scale = float(
+        configuration.get(
+            "rotation_normalization_scale",
+            1.0,
+        )
+    )
+
+    if rotation_normalization_scale <= 0.0:
+        raise ValueError(
+            "Checkpoint rotation_normalization_scale must be "
+            "greater than zero, but received "
+            f"{rotation_normalization_scale}."
+        )
+
+    pose_loss_type = str(
+        configuration.get(
+            "pose_loss_type",
+            "mse",
+        )
+    ).lower()
+
+    if pose_loss_type not in {"mse", "mae"}:
+        raise ValueError(
+            "Unsupported checkpoint pose_loss_type: "
+            f"{pose_loss_type!r}. Expected 'mse' or 'mae'."
+        )
+
     rotation_geometry_weight = float(
         configuration.get(
             "rotation_geometry_weight",
@@ -518,6 +575,10 @@ def resolve_evaluation_configuration(
         "height": height,
         "width": width,
         "camera": camera,
+        "rotation_normalization_scale": (
+            rotation_normalization_scale
+        ),
+        "pose_loss_type": pose_loss_type,
         "pretrained_semantic": pretrained_semantic,
         "freeze_semantic": freeze_semantic,
         "semantic_map_mode": semantic_map_mode,
@@ -681,6 +742,11 @@ def build_model(
                 "rotation_pool_size"
             ]
         ),
+        rotation_normalization_scale=float(
+            evaluation_configuration[
+                "rotation_normalization_scale"
+            ]
+        ),
         translation_decoder_type=str(
             evaluation_configuration[
                 "translation_decoder"
@@ -799,6 +865,8 @@ def evaluate_model(
     device: torch.device,
     rotation_loss_weight: float,
     translation_loss_weight: float,
+    pose_loss_type: str,
+    rotation_normalization_scale: float,
     use_ground_truth_rotation: bool,
     use_internal_depth: bool,
     log_interval: int,
@@ -825,13 +893,55 @@ def evaluate_model(
     all_translation_representations: List[np.ndarray] = []
     translation_rep_buffer: Dict[str, Tensor] = {}
 
-    rotation_criterion = nn.MSELoss(reduction="sum")
-    translation_criterion = nn.MSELoss(reduction="sum")
+    # --------------------------------------------------------------
+    # Physical-unit diagnostic criteria.
+    #
+    # These remain MSE regardless of the training objective because
+    # MSE/RMSE are useful physical evaluation metrics and preserve
+    # comparability with A1.
+    # --------------------------------------------------------------
+    rotation_mse_criterion = nn.MSELoss(
+        reduction="sum"
+    )
+    translation_mse_criterion = nn.MSELoss(
+        reduction="sum"
+    )
+
+    # --------------------------------------------------------------
+    # Checkpoint/training-objective-compatible criterion.
+    #
+    # A1 -> MSE
+    # A2 -> MAE/L1
+    # --------------------------------------------------------------
+    if pose_loss_type == "mse":
+        objective_criterion = nn.MSELoss(
+            reduction="sum"
+        )
+    elif pose_loss_type == "mae":
+        objective_criterion = nn.L1Loss(
+            reduction="sum"
+        )
+    else:
+        raise ValueError(
+            "pose_loss_type must be 'mse' or 'mae', "
+            f"but received {pose_loss_type!r}."
+        )
+
+    if rotation_normalization_scale <= 0.0:
+        raise ValueError(
+            "rotation_normalization_scale must be greater than zero, "
+            f"but received {rotation_normalization_scale}."
+        )
 
     frame_predictions: List[FramePrediction] = []
 
+    # Physical MSE accumulators.
     total_rotation_squared_error = 0.0
     total_translation_squared_error = 0.0
+
+    # Training-objective-compatible accumulators.
+    total_rotation_objective_error = 0.0
+    total_translation_objective_error = 0.0
 
     num_samples = 0
     num_batches = 0
@@ -1117,7 +1227,20 @@ def evaluate_model(
             all_translation_representations.append(
                 batch_translation_representation.numpy()
             )
+
+            # Physical Euler prediction in radians.
+            #
+            # DeepDCTVO guarantees that outputs["rotation"] has already been
+            # de-normalized using rotation_normalization_scale.
             rotation_pred = outputs["rotation"]
+
+            # Raw regression-space rotation prediction.
+            #
+            # A2 uses this tensor for its normalized MAE objective.
+            rotation_pred_normalized = outputs[
+                "rotation_normalized"
+            ]
+
             translation_pred = outputs[
                 "directional_translation"
             ]
@@ -1138,6 +1261,22 @@ def evaluate_model(
                     "translation prediction has unexpected shape: "
                     f"{tuple(translation_pred.shape)}."
                 )
+                        
+            if (
+                rotation_pred_normalized.shape
+                != expected_shape
+            ):
+                raise ValueError(
+                    "normalized rotation prediction has unexpected shape: "
+                    f"{tuple(rotation_pred_normalized.shape)}."
+                )
+
+            if not torch.isfinite(
+                rotation_pred_normalized
+            ).all():
+                raise FloatingPointError(
+                    "Non-finite normalized rotation prediction encountered."
+                )
 
             if not torch.isfinite(rotation_pred).all():
                 raise FloatingPointError(
@@ -1148,13 +1287,42 @@ def evaluate_model(
                 raise FloatingPointError(
                     "Non-finite translation prediction encountered."
                 )
-
-            rotation_sum_squared_error = rotation_criterion(
-                rotation_pred,
-                rotation_gt,
+            
+            # --------------------------------------------------------------
+            # Rotation target in the same regression space used by Model R.
+            #
+            # A1:
+            #     scale = 1.0
+            #
+            # A2:
+            #     scale = 0.175
+            #
+            # Dataset labels remain physical radians.
+            # --------------------------------------------------------------
+            rotation_gt_normalized = (
+                rotation_gt
+                / rotation_normalization_scale
             )
+
+            if not torch.isfinite(
+                rotation_gt_normalized
+            ).all():
+                raise FloatingPointError(
+                    "Non-finite normalized rotation target encountered."
+                )
+
+            # --------------------------------------------------------------
+            # Physical-unit MSE diagnostics
+            # --------------------------------------------------------------
+            rotation_sum_squared_error = (
+                rotation_mse_criterion(
+                    rotation_pred,
+                    rotation_gt,
+                )
+            )
+
             translation_sum_squared_error = (
-                translation_criterion(
+                translation_mse_criterion(
                     translation_pred,
                     translation_gt,
                 )
@@ -1163,8 +1331,39 @@ def evaluate_model(
             total_rotation_squared_error += float(
                 rotation_sum_squared_error.item()
             )
+
             total_translation_squared_error += float(
                 translation_sum_squared_error.item()
+            )
+
+            # --------------------------------------------------------------
+            # Training-objective-compatible held-out loss
+            #
+            # Rotation is evaluated in normalized regression space so that
+            # this value is directly comparable with A2 validation loss.
+            #
+            # Translation remains in its existing physical/directional space.
+            # --------------------------------------------------------------
+            rotation_objective_error = (
+                objective_criterion(
+                    rotation_pred_normalized,
+                    rotation_gt_normalized,
+                )
+            )
+
+            translation_objective_error = (
+                objective_criterion(
+                    translation_pred,
+                    translation_gt,
+                )
+            )
+
+            total_rotation_objective_error += float(
+                rotation_objective_error.item()
+            )
+
+            total_translation_objective_error += float(
+                translation_objective_error.item()
             )
 
             rotation_gt_np = (
@@ -1386,21 +1585,36 @@ def evaluate_model(
                     / (num_samples * 3)
                 )
 
-                running_total = (
+                running_rotation_objective = (
+                    total_rotation_objective_error
+                    / (num_samples * 3)
+                )
+
+                running_translation_objective = (
+                    total_translation_objective_error
+                    / (num_samples * 3)
+                )
+
+                running_objective = (
                     rotation_loss_weight
-                    * running_rotation_mse
+                    * running_rotation_objective
                     + translation_loss_weight
-                    * running_translation_mse
+                    * running_translation_objective
                 )
 
                 print(
                     f"evaluation "
                     f"batch={num_batches} "
                     f"samples={num_samples} "
-                    f"loss={running_total:.6f} "
+                    f"objective={pose_loss_type} "
+                    f"loss={running_objective:.6f} "
                     f"rotation_loss="
-                    f"{running_rotation_mse:.6f} "
+                    f"{running_rotation_objective:.6f} "
                     f"translation_loss="
+                    f"{running_translation_objective:.6f} "
+                    f"physical_rotation_mse="
+                    f"{running_rotation_mse:.6f} "
+                    f"physical_translation_mse="
                     f"{running_translation_mse:.6f}"
                 )
 
@@ -1489,6 +1703,27 @@ def evaluate_model(
         np.mean(translation_error ** 2)
     )
 
+    # --------------------------------------------------------------
+    # Held-out objective in the same space and with the same loss
+    # definition used during training/validation.
+    # --------------------------------------------------------------
+    rotation_objective_loss = (
+        total_rotation_objective_error
+        / (num_samples * 3)
+    )
+
+    translation_objective_loss = (
+        total_translation_objective_error
+        / (num_samples * 3)
+    )
+
+    total_objective_loss = (
+        rotation_loss_weight
+        * rotation_objective_loss
+        + translation_loss_weight
+        * translation_objective_loss
+    )
+
     total_mse = (
         rotation_loss_weight * rotation_mse
         + translation_loss_weight * translation_mse
@@ -1511,8 +1746,23 @@ def evaluate_model(
     )
 
     metrics = AggregateMetrics(
+        objective_name=pose_loss_type,
+
+        total_objective_loss=float(
+            total_objective_loss
+        ),
+
+        rotation_objective_loss=float(
+            rotation_objective_loss
+        ),
+
+        translation_objective_loss=float(
+            translation_objective_loss
+        ),
+
         total_mse=float(total_mse),
         rotation_mse=rotation_mse,
+
         translation_mse=translation_mse,
         rotation_rmse=float(math.sqrt(rotation_mse)),
         translation_rmse=float(
@@ -2393,10 +2643,20 @@ def write_checkpoint_comparison(
             if validation_translation is not None
             else None
         ),
-        "test_total_loss": test_metrics.total_mse,
-        "test_rotation_loss": test_metrics.rotation_mse,
+        "objective_name": (
+            test_metrics.objective_name
+        ),
+
+        "test_total_loss": (
+            test_metrics.total_objective_loss
+        ),
+
+        "test_rotation_loss": (
+            test_metrics.rotation_objective_loss
+        ),
+
         "test_translation_loss": (
-            test_metrics.translation_mse
+            test_metrics.translation_objective_loss
         ),
         "test_to_validation_total_ratio": None,
         "test_to_validation_rotation_ratio": None,
@@ -2407,7 +2667,7 @@ def write_checkpoint_comparison(
         comparison[
             "test_to_validation_total_ratio"
         ] = (
-            test_metrics.total_mse
+            test_metrics.total_objective_loss
             / float(validation_total)
         )
 
@@ -2415,7 +2675,7 @@ def write_checkpoint_comparison(
         comparison[
             "test_to_validation_rotation_ratio"
         ] = (
-            test_metrics.rotation_mse
+            test_metrics.rotation_objective_loss
             / float(validation_rotation)
         )
 
@@ -2423,7 +2683,7 @@ def write_checkpoint_comparison(
         comparison[
             "test_to_validation_translation_ratio"
         ] = (
-            test_metrics.translation_mse
+            test_metrics.translation_objective_loss
             / float(validation_translation)
         )
 
@@ -2431,6 +2691,7 @@ def write_checkpoint_comparison(
         "DeepDCT-VO checkpoint comparison",
         "=" * 52,
         f"Checkpoint epoch: {checkpoint.get('epoch')}",
+        f"Objective:        {test_metrics.objective_name.upper()}",
         "",
         f"Validation total loss: "
         f"{comparison['validation_total_loss']}",
@@ -2618,7 +2879,35 @@ def print_summary(
     print(f"Checkpoint epoch:       {checkpoint.get('epoch')}")
     print(f"Test samples:           {metrics.num_samples}")
     print(f"Test batches:           {metrics.num_batches}")
-    print(f"Total MSE:              {metrics.total_mse:.9f}")
+
+    print(
+        f"Pose objective:         "
+        f"{metrics.objective_name.upper()}"
+    )
+
+    print(
+        f"Rotation norm scale:    "
+        f"{float(evaluation_configuration['rotation_normalization_scale']):.6f}"
+    )
+
+    print(
+        f"Objective total loss:   "
+        f"{metrics.total_objective_loss:.9f}"
+    )
+
+    print(
+        f"Objective rotation:     "
+        f"{metrics.rotation_objective_loss:.9f}"
+    )
+
+    print(
+        f"Objective translation:  "
+        f"{metrics.translation_objective_loss:.9f}"
+    )
+
+    print("-" * 72)
+
+    print(f"Physical Total MSE:     {metrics.total_mse:.9f}")
     print(f"Rotation MSE:           {metrics.rotation_mse:.9f}")
     print(
         f"Translation MSE:        "
@@ -2699,6 +2988,25 @@ def main() -> None:
             checkpoint=checkpoint,
         )
     )
+
+    # --------------------------------------------------------------
+    # A2 rotation normalization is defined for radian-valued labels.
+    # --------------------------------------------------------------
+    rotation_normalization_scale = float(
+        evaluation_configuration[
+            "rotation_normalization_scale"
+        ]
+    )
+
+    if (
+        rotation_normalization_scale != 1.0
+        and args.angles_in_degrees
+    ):
+        raise ValueError(
+            "A normalized-rotation checkpoint cannot be evaluated "
+            "with --angles-in-degrees. "
+            "A2 rotation normalization uses physical radians."
+        )
 
     rotation_geometry_enabled = (
         float(
@@ -2823,6 +3131,16 @@ def main() -> None:
         f"{actual_rotation_representation_dim}"
     )
 
+    print(
+        f"Pose objective:     "
+        f"{str(evaluation_configuration['pose_loss_type']).upper()}"
+    )
+
+    print(
+        f"Rotation scale:     "
+        f"{float(evaluation_configuration['rotation_normalization_scale']):.6f}"
+    )
+
     if rotation_geometry_enabled:
         print(
             f"Geometry weight:   "
@@ -2868,6 +3186,17 @@ def main() -> None:
         ),
         translation_loss_weight=float(
             evaluation_configuration["translation_loss_weight"]
+        ),
+        pose_loss_type=str(
+            evaluation_configuration[
+                "pose_loss_type"
+            ]
+        ),
+
+        rotation_normalization_scale=float(
+            evaluation_configuration[
+                "rotation_normalization_scale"
+            ]
         ),
         use_ground_truth_rotation=args.use_ground_truth_rotation,
         use_internal_depth=bool(

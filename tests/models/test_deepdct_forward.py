@@ -154,12 +154,29 @@ def test_deepdct_vo_forward_returns_motion_vectors(model, inputs):
 
     assert set(outputs) == {
         "rotation",
+        "rotation_normalized",
         "directional_translation",
         "rotation_used_for_translation",
     }
     assert outputs["rotation"].shape == (2, 3)
     assert outputs["directional_translation"].shape == (2, 3)
     assert outputs["rotation_used_for_translation"].shape == (2, 3)
+    assert outputs["rotation_normalized"].shape == (
+        image_prev.shape[0],
+        3,
+    )
+
+    expected_rotation = (
+        outputs["rotation_normalized"]
+        * model.rotation_normalization_scale
+    )
+
+    assert torch.allclose(
+        outputs["rotation"],
+        expected_rotation,
+        atol=1.0e-6,
+        rtol=1.0e-6,
+    )
 
     for value in outputs.values():
         assert torch.isfinite(value).all()

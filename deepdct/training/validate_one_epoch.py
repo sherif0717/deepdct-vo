@@ -101,13 +101,15 @@ def validate_one_epoch(
         Validation device, such as ``"cpu"`` or ``torch.device("cuda")``.
 
     rotation_criterion:
-        Loss function for predicted versus ground-truth rotation.
-        Defaults to ``torch.nn.MSELoss()``.
+        Loss function for predicted versus ground-truth normalized
+        rotation. Defaults to ``torch.nn.L1Loss()`` for the A2
+        paper-style MAE objective.
 
     translation_criterion:
         Callable loss function for predicted versus ground-truth
         directional translation. It must accept ``(prediction, target)``
-        and return a scalar tensor. Defaults to ``torch.nn.MSELoss()``.
+        and return a scalar tensor. Defaults to ``torch.nn.L1Loss()``
+        for the A2 paper-style MAE objective.
 
     rotation_loss_weight:
         Scalar multiplier applied to the rotation loss.
@@ -149,11 +151,17 @@ def validate_one_epoch(
 
     device = torch.device(device)
 
+    # ---------------------------------------------------------------
+    # A2 paper-style pose objective
+    #
+    # The paper uses MAE/L1 rather than MSE for both rotation and
+    # directional translation.
+    # ---------------------------------------------------------------
     if rotation_criterion is None:
-        rotation_criterion = nn.MSELoss()
+        rotation_criterion = nn.L1Loss()
 
     if translation_criterion is None:
-        translation_criterion = nn.MSELoss()
+        translation_criterion = nn.L1Loss()
 
     _validate_configuration(
         rotation_loss_weight=rotation_loss_weight,
@@ -161,6 +169,43 @@ def validate_one_epoch(
         rotation_geometry_weight=rotation_geometry_weight,
         log_interval=log_interval,
     )
+
+    # ---------------------------------------------------------------
+    # A2 rotation-normalization configuration
+    #
+    # Resolve once per validation epoch rather than once per batch.
+    #
+    # A1:
+    #     rotation_normalization_scale = 1.0
+    #
+    # A2:
+    #     rotation_normalization_scale = 0.175
+    # ---------------------------------------------------------------
+    model_for_configuration = (
+        model.module
+        if hasattr(model, "module")
+        else model
+    )
+
+    if not hasattr(
+        model_for_configuration,
+        "rotation_normalization_scale",
+    ):
+        raise AttributeError(
+            "The model does not expose "
+            "'rotation_normalization_scale'. "
+            "The A2-compatible DeepDCTVO implementation is required."
+        )
+
+    rotation_normalization_scale = float(
+        model_for_configuration.rotation_normalization_scale
+    )
+
+    if rotation_normalization_scale <= 0.0:
+        raise ValueError(
+            "rotation_normalization_scale must be greater than zero, "
+            f"but received {rotation_normalization_scale}."
+        )
 
     model.eval()
 
@@ -201,6 +246,7 @@ def validate_one_epoch(
                     else None
                 ),
                 use_ground_truth_rotation=use_ground_truth_rotation,
+                return_intermediates=True,
             )
 
             _validate_model_outputs(
@@ -209,7 +255,12 @@ def validate_one_epoch(
                 reference=image_curr,
             )
 
-            predicted_rotation = outputs["rotation"]
+            # A2:
+            # Raw RotationHead regression output in normalized rotation units.
+            predicted_rotation_normalized = outputs[
+                "rotation_normalized"
+            ]
+
             predicted_translation = outputs[
                 "directional_translation"
             ]
@@ -218,9 +269,37 @@ def validate_one_epoch(
                 "rotation_representation"
             ]
 
+            if rotation_normalization_scale <= 0.0:
+                raise ValueError(
+                    "rotation_normalization_scale must be greater than zero, "
+                    f"but received {rotation_normalization_scale}."
+                )
+
+            rotation_gt_normalized = (
+                rotation_gt
+                / rotation_normalization_scale
+            )
+
+            if not torch.isfinite(
+                rotation_gt_normalized
+            ).all():
+                raise FloatingPointError(
+                    "Non-finite normalized rotation target encountered."
+                )
+
+            # ---------------------------------------------------------------
+            # A2 paper-style pose losses
+            #
+            # Rotation:
+            #     compare normalized Model-R prediction against normalized
+            #     physical ground-truth rotation.
+            #
+            # Translation:
+            #     remains in its existing physical/directional representation.
+            # ---------------------------------------------------------------
             rotation_loss = rotation_criterion(
-                predicted_rotation,
-                rotation_gt,
+                predicted_rotation_normalized,
+                rotation_gt_normalized,
             )
 
             translation_loss = translation_criterion(
@@ -365,7 +444,7 @@ def validate_one_epoch(
             running_rotation_geometry_loss
             / processed_samples
         ),
-                num_batches=processed_batches,
+        num_batches=processed_batches,
         num_samples=processed_samples,
         elapsed_seconds=elapsed_seconds,
         skipped_batches=skipped_batches,
@@ -539,6 +618,7 @@ def _validate_model_outputs(
 
     required_keys = {
         "rotation",
+        "rotation_normalized",
         "directional_translation",
         "rotation_used_for_translation",
     }
