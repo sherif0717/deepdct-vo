@@ -579,6 +579,12 @@ def resolve_evaluation_configuration(
             rotation_normalization_scale
         ),
         "pose_loss_type": pose_loss_type,
+        "use_ground_truth_rotation": bool(
+            configuration.get(
+                "use_ground_truth_rotation",
+                False,
+            )
+        ),
         "pretrained_semantic": pretrained_semantic,
         "freeze_semantic": freeze_semantic,
         "semantic_map_mode": semantic_map_mode,
@@ -1127,6 +1133,30 @@ def evaluate_model(
                 ),
                 return_intermediates=True,
             )
+
+            # --------------------------------------------------
+            # A3 runtime audit
+            # --------------------------------------------------
+            if use_ground_truth_rotation:
+                rotation_used = outputs.get(
+                    "rotation_used_for_translation"
+                )
+
+                if rotation_used is None:
+                    raise KeyError(
+                        "A3 evaluation requires "
+                        "'rotation_used_for_translation'."
+                    )
+
+                if not torch.equal(
+                    rotation_used,
+                    rotation_gt,
+                ):
+                    raise RuntimeError(
+                        "A3 evaluation invariant failed: "
+                        "Model T did not receive the exact "
+                        "ground-truth physical rotation."
+                    )
 
             # --------------------------------------------------
             # Retrieve rotation representation captured by the
@@ -2990,6 +3020,27 @@ def main() -> None:
     )
 
     # --------------------------------------------------------------
+    # Model-T rotation conditioning
+    #
+    # A3 checkpoints record use_ground_truth_rotation=True.
+    # Restore that automatically so evaluation cannot accidentally
+    # turn an A3 checkpoint back into predicted-rotation inference.
+    #
+    # The CLI flag remains useful for explicitly running a GT-rotation
+    # diagnostic on an older/A1/A2 checkpoint.
+    # --------------------------------------------------------------
+    checkpoint_uses_gt_rotation = bool(
+        evaluation_configuration[
+            "use_ground_truth_rotation"
+        ]
+    )
+
+    effective_use_ground_truth_rotation = (
+        checkpoint_uses_gt_rotation
+        or args.use_ground_truth_rotation
+    )
+
+    # --------------------------------------------------------------
     # A2 rotation normalization is defined for radian-valued labels.
     # --------------------------------------------------------------
     rotation_normalization_scale = float(
@@ -3164,8 +3215,22 @@ def main() -> None:
 
     print(
         f"GT rotation conditioning: "
-        f"{args.use_ground_truth_rotation}"
+        f"{effective_use_ground_truth_rotation}"
     )
+
+    print(
+        f"Checkpoint GT rotation:   "
+        f"{checkpoint_uses_gt_rotation}"
+    )
+
+    if effective_use_ground_truth_rotation:
+        print(
+            "Model-T rotation source:   GROUND TRUTH"
+        )
+    else:
+        print(
+            "Model-T rotation source:   PREDICTED"
+        )
     print("=" * 72)
 
     (
@@ -3198,7 +3263,9 @@ def main() -> None:
                 "rotation_normalization_scale"
             ]
         ),
-        use_ground_truth_rotation=args.use_ground_truth_rotation,
+        use_ground_truth_rotation=(
+            effective_use_ground_truth_rotation
+        ),
         use_internal_depth=bool(
             evaluation_configuration["use_depth_cues"]
         ),

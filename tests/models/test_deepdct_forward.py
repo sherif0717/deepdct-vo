@@ -213,6 +213,121 @@ def test_ground_truth_rotation_can_condition_model_t(model, inputs):
     assert torch.equal(outputs["rotation_used_for_translation"], rotation_gt)
     assert outputs["directional_translation"].shape == (2, 3)
 
+def test_a3_gt_rotation_is_not_normalized_before_model_t(
+    model,
+    inputs,
+):
+    """A3 must condition Model T with physical GT radians.
+
+    Rotation normalization belongs only to Model-R supervision.
+    """
+
+    image_prev, image_curr, depth_curr = inputs
+
+    model.rotation_normalization_scale = 0.175
+
+    rotation_gt = torch.tensor(
+        [
+            [0.010, -0.020, 0.030],
+            [-0.040, 0.050, -0.060],
+        ],
+        dtype=image_curr.dtype,
+    )
+
+    with torch.no_grad():
+        outputs = model(
+            image_prev=image_prev,
+            image_curr=image_curr,
+            depth_curr=depth_curr,
+            rotation_for_translation=rotation_gt,
+            use_ground_truth_rotation=True,
+            return_intermediates=True,
+        )
+
+    # A3 must use the exact PHYSICAL GT vector.
+    assert torch.equal(
+        outputs["rotation_used_for_translation"],
+        rotation_gt,
+    )
+
+    assert torch.equal(
+        outputs["rotation_map"][:, :, 0, 0],
+        rotation_gt,
+    )
+
+    # Explicitly guard against accidentally feeding the normalized
+    # supervision target into Model T.
+    rotation_gt_normalized = (
+        rotation_gt
+        / model.rotation_normalization_scale
+    )
+
+    assert not torch.allclose(
+        outputs["rotation_used_for_translation"],
+        rotation_gt_normalized,
+    )
+
+def test_a3_does_not_replace_model_r_prediction(
+    model,
+    inputs,
+):
+    """GT rotation alters Model-T conditioning, not Model-R output."""
+
+    image_prev, image_curr, depth_curr = inputs
+
+    model.rotation_normalization_scale = 0.175
+
+    rotation_gt = torch.tensor(
+        [
+            [0.12, -0.08, 0.04],
+            [-0.10, 0.07, -0.03],
+        ],
+        dtype=image_curr.dtype,
+    )
+
+    with torch.no_grad():
+        predicted_conditioning = model(
+            image_prev=image_prev,
+            image_curr=image_curr,
+            depth_curr=depth_curr,
+            use_ground_truth_rotation=False,
+        )
+
+        gt_conditioning = model(
+            image_prev=image_prev,
+            image_curr=image_curr,
+            depth_curr=depth_curr,
+            rotation_for_translation=rotation_gt,
+            use_ground_truth_rotation=True,
+        )
+
+    # Model R must still run normally in A3.
+    assert torch.allclose(
+        gt_conditioning["rotation"],
+        predicted_conditioning["rotation"],
+        atol=1.0e-6,
+        rtol=1.0e-6,
+    )
+
+    assert torch.allclose(
+        gt_conditioning["rotation_normalized"],
+        predicted_conditioning["rotation_normalized"],
+        atol=1.0e-6,
+        rtol=1.0e-6,
+    )
+
+    # Only the Model-T conditioning source changes.
+    assert torch.equal(
+        gt_conditioning["rotation_used_for_translation"],
+        rotation_gt,
+    )
+
+    assert torch.equal(
+        predicted_conditioning[
+            "rotation_used_for_translation"
+        ],
+        predicted_conditioning["rotation"],
+    )
 
 def test_ground_truth_mode_requires_rotation_tensor(model, inputs):
     image_prev, image_curr, depth_curr = inputs

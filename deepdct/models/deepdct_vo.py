@@ -550,6 +550,18 @@ class DeepDCTVO(nn.Module):
 
         # ---------------------------------------------------------------
         # Rotation conditioning for Model T
+        #
+        # Normal/A1/A2:
+        #     Model T receives Model R's predicted physical rotation.
+        #
+        # Track-A A3:
+        #     Model T receives the dataset ground-truth physical rotation.
+        #
+        # IMPORTANT:
+        # ``rotation_for_translation`` is already in physical Euler
+        # radians. It must NOT be divided by rotation_normalization_scale.
+        # Rotation normalization applies only to Model R's regression loss,
+        # not to the conditioning vector supplied to Model T.
         # ---------------------------------------------------------------
         if use_ground_truth_rotation:
             # Validation in _validate_image_inputs() should guarantee

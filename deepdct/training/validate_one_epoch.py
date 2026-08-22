@@ -171,7 +171,11 @@ def validate_one_epoch(
     )
 
     # ---------------------------------------------------------------
-    # A2 rotation-normalization configuration
+    # Track-A A2/A3 rotation-normalization configuration
+    #
+    # A3 retains A2's rotation objective unchanged. The only A3
+    # intervention is that Model T receives physical ground-truth
+    # rotation rather than Model R's physical prediction.
     #
     # Resolve once per validation epoch rather than once per batch.
     #
@@ -248,6 +252,31 @@ def validate_one_epoch(
                 use_ground_truth_rotation=use_ground_truth_rotation,
                 return_intermediates=True,
             )
+
+            # -------------------------------------------------------
+            # A3 invariant:
+            # Model T must receive the physical GT rotation exactly.
+            # -------------------------------------------------------
+            if use_ground_truth_rotation:
+                rotation_used = outputs.get(
+                    "rotation_used_for_translation"
+                )
+
+                if rotation_used is None:
+                    raise KeyError(
+                        "A3 requires model output "
+                        "'rotation_used_for_translation'."
+                    )
+
+                if not torch.equal(
+                    rotation_used,
+                    rotation_gt,
+                ):
+                    raise RuntimeError(
+                        "A3 conditioning invariant failed: "
+                        "Model T did not receive the exact "
+                        "ground-truth physical rotation."
+                    )
 
             _validate_model_outputs(
                 outputs=outputs,

@@ -34,6 +34,7 @@ randomly initialized semantic model.
 from __future__ import annotations
 
 import argparse
+import math
 import random
 import shutil
 from pathlib import Path
@@ -375,8 +376,9 @@ def parse_args() -> argparse.Namespace:
         "--use-ground-truth-rotation",
         action="store_true",
         help=(
-            "Condition Model T on ground-truth rotation rather than "
-            "Model R's prediction."
+            "Condition Model T on physical ground-truth rotation rather "
+            "than Model R's predicted physical rotation. "
+            "Used by Track-A A3."
         ),
     )
 
@@ -868,25 +870,77 @@ def validate_args(args: argparse.Namespace) -> None:
         )
 
     if args.pose_loss_type == "mae":
+        # ----------------------------------------------------------
+        # Track-A A2/A3 common configuration.
+        #
+        # A2:
+        #     predicted rotation -> Model T
+        #
+        # A3:
+        #     ground-truth rotation -> Model T
+        #
+        # Both retain the same MAE pose objective and must not mix
+        # with the unrelated representation/geometry experiments.
+        # ----------------------------------------------------------
         if args.rotation_geometry_weight != 0.0:
             raise ValueError(
-                "Track-A A2 must not enable rotation geometry supervision."
-            )
-
-        if args.use_ground_truth_rotation:
-            raise ValueError(
-                "Track-A A2 must use predicted rotation for Model T. "
-                "Ground-truth rotation conditioning belongs to A3."
+                "Track-A A2/A3 must not enable rotation "
+                "geometry supervision."
             )
 
         if args.translation_head_only:
             raise ValueError(
-                "Track-A A2 must train the complete A1 pose model."
+                "Track-A A2/A3 must train the complete pose model."
             )
 
         if args.rotation_readout_only:
             raise ValueError(
-                "Track-A A2 must not use rotation-readout-only training."
+                "Track-A A2/A3 must not use "
+                "rotation-readout-only training."
+            )
+        
+    # --------------------------------------------------------------
+    # Track-A A3 invariants
+    # --------------------------------------------------------------
+    if args.use_ground_truth_rotation:
+        if args.pose_loss_type != "mae":
+            raise ValueError(
+                "Track-A A3 requires --pose-loss-type mae."
+            )
+
+        if not math.isclose(
+            args.rotation_normalization_scale,
+            0.175,
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        ):
+            raise ValueError(
+                "Track-A A3 requires "
+                "--rotation-normalization-scale 0.175."
+            )
+
+        if args.translation_decoder != "dense":
+            raise ValueError(
+                "Track-A A3 requires "
+                "--translation-decoder dense."
+            )
+
+        if args.use_semantic_cues:
+            raise ValueError(
+                "Track-A A3 must keep semantic cues disabled. "
+                "Semantic/depth auxiliaries belong to A4."
+            )
+
+        if args.use_depth_cues:
+            raise ValueError(
+                "Track-A A3 must keep depth cues disabled. "
+                "Semantic/depth auxiliaries belong to A4."
+            )
+
+        if args.init_checkpoint is not None:
+            raise ValueError(
+                "Track-A A3 is a clean training run and must not "
+                "use --init-checkpoint."
             )
 
     if args.translation_loss_weight < 0:
@@ -1885,23 +1939,27 @@ def save_checkpoint(
             "name": args.experiment_name,
             "source_experiment": args.source_experiment,
             "experiment_type": (
-                "frozen_rotation_representation_linear_readout"
-                if args.rotation_readout_only
+                "track_a_a3_gt_rotation_model_t"
+                if args.use_ground_truth_rotation
                 else (
-                    (
-                        "frozen_representation_linear_readout"
-                        if args.translation_decoder
-                        == "pooled_linear"
-                        else "translation_head_only_finetune"
-                    )
-                    if args.translation_head_only
+                    "frozen_rotation_representation_linear_readout"
+                    if args.rotation_readout_only
                     else (
-                        "continuous_so3_rotation_geometry"
-                        if args.rotation_geometry_weight > 0.0
+                        (
+                            "frozen_representation_linear_readout"
+                            if args.translation_decoder
+                            == "pooled_linear"
+                            else "translation_head_only_finetune"
+                        )
+                        if args.translation_head_only
                         else (
-                            "warm_start_cue_adaptation"
-                            if warm_start_metadata is not None
-                            else "standard_training"
+                            "continuous_so3_rotation_geometry"
+                            if args.rotation_geometry_weight > 0.0
+                            else (
+                                "warm_start_cue_adaptation"
+                                if warm_start_metadata is not None
+                                else "standard_training"
+                            )
                         )
                     )
                 )
@@ -2290,6 +2348,17 @@ def print_run_summary(
         f"{args.rotation_normalization_scale:.6f}"
     )
 
+    print(
+        f"Model-T rotation:      "
+        f"{'GROUND TRUTH' if args.use_ground_truth_rotation else 'PREDICTED'}"
+    )
+
+    if args.use_ground_truth_rotation:
+        print(
+            "Track-A stage:         "
+            "A3 GT rotation -> Model T"
+        )
+
     if args.rotation_geometry_weight > 0.0:
         print(
             f"Rotation geom bank:    "
@@ -2483,11 +2552,11 @@ def print_epoch_summary(
         f"{training_metrics.rotation_loss:.6f}"
     )
     print(
-        f"Train rotation geometry:"
+        f"Train rotation geometry: "
         f" {training_metrics.rotation_geometry_loss:.6f}"
     )
     print(
-        f"Train translation loss: "
+        f"Train translation loss:  "
         f"{training_metrics.translation_loss:.6f}"
     )
     print(
@@ -2499,7 +2568,7 @@ def print_epoch_summary(
         f"{validation_metrics.rotation_loss:.6f}"
     )
     print(
-        f"Validation rot geometry:"
+        f"Validation rot geometry:  "
         f" {validation_metrics.rotation_geometry_loss:.6f}"
     )
     print(

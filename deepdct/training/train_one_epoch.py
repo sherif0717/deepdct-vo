@@ -217,6 +217,44 @@ def train_one_epoch(
         log_interval=log_interval,
     )
 
+    # ---------------------------------------------------------------
+    # Track-A A2/A3 rotation-normalization configuration
+    #
+    # Model R learns in normalized rotation space:
+    #
+    #     rotation_gt_normalized =
+    #         rotation_gt / rotation_normalization_scale
+    #
+    # A1 uses scale=1.0, so this remains exactly equivalent to the
+    # original physical-radian objective.
+    #
+    # A2 and A3 use scale=0.175.
+    # ---------------------------------------------------------------
+    model_for_configuration = (
+        model.module
+        if hasattr(model, "module")
+        else model
+    )
+
+    if not hasattr(
+        model_for_configuration,
+        "rotation_normalization_scale",
+    ):
+        raise AttributeError(
+            "The model does not expose "
+            "'rotation_normalization_scale'."
+        )
+
+    rotation_normalization_scale = float(
+        model_for_configuration.rotation_normalization_scale
+    )
+
+    if rotation_normalization_scale <= 0.0:
+        raise ValueError(
+            "rotation_normalization_scale must be greater than zero, "
+            f"but received {rotation_normalization_scale}."
+        )
+
     if keep_model_in_eval_mode:
         # Gradients are still enabled. eval() only fixes module behavior
         # such as BatchNorm running statistics and dropout.
@@ -275,22 +313,58 @@ def train_one_epoch(
             reference=image_curr,
         )
 
-        predicted_rotation = outputs["rotation"]
-        predicted_translation = outputs["directional_translation"]
+        # -----------------------------------------------------------
+        # Track-A A2/A3 pose objective
+        #
+        # Model R predicts in normalized regression space.
+        # Dataset ground truth remains physical Euler radians.
+        #
+        # A1:
+        #     scale = 1.0
+        #
+        # A2/A3:
+        #     scale = 0.175
+        #
+        # Model T conditioning remains PHYSICAL rotation. The
+        # normalization below is exclusively for Model-R supervision.
+        # -----------------------------------------------------------
+        predicted_rotation_normalized = outputs[
+            "rotation_normalized"
+        ]
+
+        predicted_translation = outputs[
+            "directional_translation"
+        ]
 
         rotation_representation = outputs[
             "rotation_representation"
         ]
 
+        rotation_gt_normalized = (
+            rotation_gt
+            / rotation_normalization_scale
+        )
+
+        if not torch.isfinite(
+            rotation_gt_normalized
+        ).all():
+            raise FloatingPointError(
+                "Non-finite normalized rotation target encountered."
+            )
 
         rotation_loss = rotation_criterion(
-            predicted_rotation,
-            rotation_gt,
+            predicted_rotation_normalized,
+            rotation_gt_normalized,
         )
 
         translation_loss = translation_criterion(
             predicted_translation,
             translation_gt,
+        )
+
+        _validate_scalar_loss(
+            loss=rotation_loss,
+            name="rotation_loss",
         )
 
         if rotation_geometry_weight > 0.0:
@@ -886,7 +960,7 @@ def _print_progress(
         f"samples={processed_samples} "
         f"loss={average_total:.6f} "
         f"rotation_loss={average_rotation:.6f} "
-        f"translation_loss={average_translation:.6f}"
+        f"translation_loss={average_translation:.6f} "
         f"rotation_geometry_loss="
         f"{average_rotation_geometry:.6f}"
     )

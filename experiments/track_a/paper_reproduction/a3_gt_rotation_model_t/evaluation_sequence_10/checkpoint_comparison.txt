@@ -1,0 +1,21 @@
+DeepDCT-VO checkpoint comparison
+====================================================
+Checkpoint epoch: 6
+Objective:        MAE
+
+Validation total loss: 0.10483994546445942
+Test total loss:       0.128969119
+Test/validation ratio: 1.2301524813584146
+
+Validation rotation:   0.02519841631171557
+Test rotation:         0.022898473
+Test/validation ratio: 0.9087266902365421
+
+Validation translation: 0.07964152910002747
+Test translation:      0.106070646
+Test/validation ratio: 1.3318509426309
+
+Interpretation:
+  ratio near 1.0: test performance is close to validation
+  moderately above 1.0: sequence/domain shift is present
+  substantially above 1.0: strong generalization gap
