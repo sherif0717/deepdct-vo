@@ -332,6 +332,29 @@ def parse_args() -> argparse.Namespace:
         help="Skip trajectory reconstruction and trajectory metrics.",
     )
 
+    # ----------------------------------------------------------
+    # Track-A A5: paper translation scaling / post-processing.
+    #
+    # The network predictions and frame-level metrics remain
+    # untouched. This factor is applied only when reconstructing
+    # the predicted trajectory.
+    #
+    # Examples:
+    #     1.000 -> unscaled control
+    #     0.975 -> paper sequence-09 scaling
+    #     1.007 -> paper sequence-10 scaling
+    # ----------------------------------------------------------
+    parser.add_argument(
+        "--translation-scale-factor",
+        type=float,
+        default=1.0,
+        help=(
+            "A5 multiplicative scale applied to predicted directional "
+            "translation only during trajectory reconstruction. "
+            "Frame-level predictions and losses remain unscaled."
+        ),
+    )
+
     parser.add_argument(
         "--euler-order",
         choices=["xyz", "zyx"],
@@ -379,6 +402,16 @@ def validate_args(args: argparse.Namespace) -> None:
 
     if args.log_interval <= 0:
         raise ValueError("--log-interval must be positive.")
+    
+    if not math.isfinite(args.translation_scale_factor):
+        raise ValueError(
+            "--translation-scale-factor must be finite."
+        )
+
+    if args.translation_scale_factor <= 0.0:
+        raise ValueError(
+            "--translation-scale-factor must be greater than zero."
+        )
 
     for name in (
         "rotation_loss_weight",
@@ -2913,7 +2946,9 @@ def print_summary(
     checkpoint: Mapping[str, object],
     metrics: AggregateMetrics,
     trajectory_metrics: Optional[TrajectoryMetrics],
+    unscaled_trajectory_metrics: Optional[TrajectoryMetrics],
     evaluation_configuration: Mapping[str, object],
+    translation_scale_factor: float,
     output_dir: Path,
 ) -> None:
     """Print final evaluation results."""
@@ -3048,6 +3083,16 @@ def print_summary(
     )
 
     print(
+        f"A5 translation scale:   "
+        f"{translation_scale_factor:.6f}"
+    )
+
+    print(
+        "A5 scaling scope:     "
+        "trajectory post-processing only"
+    )
+
+    print(
         f"Objective total loss:   "
         f"{metrics.total_objective_loss:.9f}"
     )
@@ -3091,6 +3136,46 @@ def print_summary(
 
     if trajectory_metrics is not None:
         print("-" * 72)
+
+        if unscaled_trajectory_metrics is not None:
+            print("Trajectory results: UNscaled control")
+            print(
+                f"ATE RMSE:               "
+                f"{unscaled_trajectory_metrics.ate_rmse:.6f}"
+            )
+            print(
+                f"RPE translation RMSE:   "
+                f"{unscaled_trajectory_metrics.rpe_translation_rmse:.6f}"
+            )
+            print(
+                f"RPE rotation RMSE:      "
+                f"{unscaled_trajectory_metrics.rpe_rotation_rmse_degrees:.6f} deg"
+            )
+            print(
+                f"Endpoint error:         "
+                f"{unscaled_trajectory_metrics.endpoint_error:.6f}"
+            )
+            print(
+                f"Endpoint error:         "
+                f"{unscaled_trajectory_metrics.endpoint_error_percent:.3f}%"
+            )
+            print(
+                f"Approx. translation drift: "
+                f"{unscaled_trajectory_metrics.translational_drift_percent:.3f}%"
+            )
+            print(
+                "Approx. rotation drift:    "
+                f"{unscaled_trajectory_metrics.rotational_drift_degrees_per_100m:.3f} "
+                "deg/100m"
+            )
+
+            print("-" * 72)
+
+        print(
+            "Trajectory results: A5 post-processed "
+            f"(translation scale={translation_scale_factor:.6f})"
+        )
+
         print(
             f"ATE RMSE:               "
             f"{trajectory_metrics.ate_rmse:.6f}"
@@ -3120,10 +3205,6 @@ def print_summary(
             f"{trajectory_metrics.rotational_drift_degrees_per_100m:.3f} "
             "deg/100m"
         )
-
-    print("-" * 72)
-    print(f"Outputs saved to:       {output_dir.resolve()}")
-    print("=" * 72)
 
 def main() -> None:
     """Run held-out evaluation."""
@@ -3528,7 +3609,9 @@ def main() -> None:
 
     plot_error_histogram(
         errors=rotation_l2_errors,
-        title="Sequence 10 rotation error distribution",
+        title=(
+            f"Sequence {args.sequence} rotation error distribution"
+        ),
         x_label="Rotation L2 error",
         output_path=(
             args.output_dir
@@ -3538,7 +3621,9 @@ def main() -> None:
 
     plot_error_histogram(
         errors=translation_l2_errors,
-        title="Sequence 10 translation error distribution",
+        title=(
+            f"Sequence {args.sequence} translation error distribution"
+        ),
         x_label="Translation L2 error",
         output_path=(
             args.output_dir
@@ -3546,7 +3631,20 @@ def main() -> None:
         ),
     )
 
+    # ----------------------------------------------------------
+    # Track-A A5: translation-scale post-processing
+    #
+    # IMPORTANT:
+    #   - translation_pred remains the raw network prediction.
+    #   - frame-level metrics remain identical to A4.
+    #   - scaling is applied only to the copy used for predicted
+    #     trajectory reconstruction.
+    #
+    # Both unscaled and post-processed trajectories are retained
+    # so A5 can quantify exactly what the paper scaling changes.
+    # ----------------------------------------------------------
     trajectory_metrics: Optional[TrajectoryMetrics] = None
+    unscaled_trajectory_metrics: Optional[TrajectoryMetrics] = None
 
     if not args.skip_trajectory:
         ground_truth_trajectory = integrate_relative_poses(
@@ -3556,9 +3654,47 @@ def main() -> None:
             angles_in_degrees=args.angles_in_degrees,
         )
 
-        predicted_trajectory = integrate_relative_poses(
+        # ------------------------------------------------------
+        # A5 control trajectory:
+        # exact raw network output, identical to A4 behavior.
+        # ------------------------------------------------------
+        unscaled_predicted_trajectory = integrate_relative_poses(
             rotations=rotation_pred,
             translations=translation_pred,
+            euler_order=args.euler_order,
+            angles_in_degrees=args.angles_in_degrees,
+        )
+
+        unscaled_trajectory_metrics = compute_trajectory_metrics(
+            ground_truth_trajectory=ground_truth_trajectory,
+            predicted_trajectory=unscaled_predicted_trajectory,
+        )
+
+        # ------------------------------------------------------
+        # A5 paper post-processing.
+        #
+        # Scale directional translation uniformly in all three
+        # components before the evaluator's existing directional-
+        # translation -> SE(3) reconstruction.
+        #
+        # Do NOT modify translation_pred in place.
+        # ------------------------------------------------------
+        postprocessed_translation_pred = (
+            translation_pred
+            * float(args.translation_scale_factor)
+        )
+
+        if not np.all(
+            np.isfinite(postprocessed_translation_pred)
+        ):
+            raise FloatingPointError(
+                "A5 post-processed translation contains "
+                "non-finite values."
+            )
+
+        predicted_trajectory = integrate_relative_poses(
+            rotations=rotation_pred,
+            translations=postprocessed_translation_pred,
             euler_order=args.euler_order,
             angles_in_degrees=args.angles_in_degrees,
         )
@@ -3568,6 +3704,13 @@ def main() -> None:
             predicted_trajectory=predicted_trajectory,
         )
 
+        # ------------------------------------------------------
+        # Save GT, raw prediction, and A5 post-processed result.
+        #
+        # predicted_trajectory.txt remains the primary result so
+        # downstream plotting/evaluation tools automatically use
+        # the A5 trajectory.
+        # ------------------------------------------------------
         save_kitti_trajectory(
             args.output_dir
             / "ground_truth_trajectory.txt",
@@ -3576,10 +3719,56 @@ def main() -> None:
 
         save_kitti_trajectory(
             args.output_dir
+            / "predicted_trajectory_unscaled.txt",
+            unscaled_predicted_trajectory,
+        )
+
+        save_kitti_trajectory(
+            args.output_dir
             / "predicted_trajectory.txt",
             predicted_trajectory,
         )
 
+        # ------------------------------------------------------
+        # Unscaled control plots
+        # ------------------------------------------------------
+        plot_trajectory(
+            ground_truth_trajectory=ground_truth_trajectory,
+            predicted_trajectory=unscaled_predicted_trajectory,
+            axis_a=0,
+            axis_b=1,
+            axis_a_label="X",
+            axis_b_label="Y",
+            title=(
+                f"Sequence {args.sequence} trajectory: "
+                "XY projection (unscaled)"
+            ),
+            output_path=(
+                args.output_dir
+                / "trajectory_xy_unscaled.png"
+            ),
+        )
+
+        plot_trajectory(
+            ground_truth_trajectory=ground_truth_trajectory,
+            predicted_trajectory=unscaled_predicted_trajectory,
+            axis_a=0,
+            axis_b=2,
+            axis_a_label="X",
+            axis_b_label="Z",
+            title=(
+                f"Sequence {args.sequence} trajectory: "
+                "XZ projection (unscaled)"
+            ),
+            output_path=(
+                args.output_dir
+                / "trajectory_xz_unscaled.png"
+            ),
+        )
+
+        # ------------------------------------------------------
+        # A5 paper-scaled trajectory plots
+        # ------------------------------------------------------
         plot_trajectory(
             ground_truth_trajectory=ground_truth_trajectory,
             predicted_trajectory=predicted_trajectory,
@@ -3587,7 +3776,12 @@ def main() -> None:
             axis_b=1,
             axis_a_label="X",
             axis_b_label="Y",
-            title="Sequence 10 trajectory: XY projection",
+            title=(
+                f"Sequence {args.sequence} trajectory: "
+                "XY projection "
+                f"(translation scale "
+                f"{args.translation_scale_factor:.6f})"
+            ),
             output_path=(
                 args.output_dir
                 / "trajectory_xy.png"
@@ -3601,7 +3795,12 @@ def main() -> None:
             axis_b=2,
             axis_a_label="X",
             axis_b_label="Z",
-            title="Sequence 10 trajectory: XZ projection",
+            title=(
+                f"Sequence {args.sequence} trajectory: "
+                "XZ projection "
+                f"(translation scale "
+                f"{args.translation_scale_factor:.6f})"
+            ),
             output_path=(
                 args.output_dir
                 / "trajectory_xz.png"
@@ -3661,20 +3860,55 @@ def main() -> None:
             ),
         },
         "frame_metrics": asdict(aggregate_metrics),
+
+        # ------------------------------------------------------
+        # Track-A A5 post-processing configuration.
+        # ------------------------------------------------------
+        "post_processing": {
+            "track_a_stage": "A5",
+            "translation_scale_enabled": (
+                not math.isclose(
+                    args.translation_scale_factor,
+                    1.0,
+                    rel_tol=0.0,
+                    abs_tol=1.0e-12,
+                )
+            ),
+            "translation_scale_factor": float(
+                args.translation_scale_factor
+            ),
+            "translation_scale_scope": (
+                "predicted directional translation during "
+                "trajectory reconstruction only"
+            ),
+            "frame_predictions_scaled": False,
+            "rotation_scaled": False,
+        },
+
+        # Primary A5 result.
         "trajectory_metrics": (
             asdict(trajectory_metrics)
             if trajectory_metrics is not None
             else None
         ),
+
+        # Raw A4-equivalent trajectory reconstructed during
+        # the same evaluator invocation.
+        "trajectory_metrics_unscaled": (
+            asdict(unscaled_trajectory_metrics)
+            if unscaled_trajectory_metrics is not None
+            else None
+        ),
+
         "validation_test_comparison": (
             checkpoint_comparison
         ),
         "trajectory_assumption": (
-            "Predicted and target directional translations were "
-            "treated as directly composable previous-frame/local "
-            "translations. Apply inverse DCT conversion first if "
-            "the stored translation labels use another coordinate "
-            "representation."
+            "Predicted and target translations use the DeepDCT "
+            "directional-translation representation. Trajectory "
+            "integration reconstructs each relative SE(3) translation "
+            "using the evaluator's R_half directional-translation "
+            "inverse mapping before composition."
         ),
     }
 
@@ -3695,7 +3929,13 @@ def main() -> None:
         checkpoint=checkpoint,
         metrics=aggregate_metrics,
         trajectory_metrics=trajectory_metrics,
+        unscaled_trajectory_metrics=(
+            unscaled_trajectory_metrics
+        ),
         evaluation_configuration=evaluation_configuration,
+        translation_scale_factor=float(
+            args.translation_scale_factor
+        ),
         output_dir=args.output_dir,
     )
 
