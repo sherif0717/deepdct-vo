@@ -144,10 +144,53 @@ class DeepDCTVO(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.use_semantic_cues = use_semantic_cues
-        self.use_depth_cues = use_depth_cues
-        self.freeze_semantic_model = freeze_semantic_model
-        self.freeze_depth_model = freeze_depth_model
+        self.use_semantic_cues = bool(
+            use_semantic_cues
+        )
+        self.use_depth_cues = bool(
+            use_depth_cues
+        )
+
+        # ---------------------------------------------------------------
+        # Auxiliary-network freeze policy
+        #
+        # Keep these synchronized with the actual branch construction.
+        # This matters because train() uses these flags to force frozen
+        # LR-ASPP / Lite-Mono modules back into eval mode after the pose
+        # network enters training mode.
+        # ---------------------------------------------------------------
+        self.freeze_semantic_model = bool(
+            freeze_semantic
+        )
+        self.freeze_depth_model = bool(
+            freeze_depth
+        )
+
+        # ---------------------------------------------------------------
+        # Track-A A4 auxiliary configuration
+        # ---------------------------------------------------------------
+        self.semantic_map_mode = str(
+            semantic_map_mode
+        )
+
+        self.depth_model_name = str(
+            depth_model_name
+        )
+
+        self.depth_output_mode = str(
+            depth_output_mode
+        )
+
+        self.depth_normalization_meters = float(
+            depth_normalization_meters
+        )
+
+        if self.depth_normalization_meters <= 0.0:
+            raise ValueError(
+                "depth_normalization_meters must be greater than zero, "
+                f"but received {self.depth_normalization_meters}."
+            )
+
         if aresunet_output_channels <= 0:
             raise ValueError(
                 "aresunet_output_channels must be positive, "
@@ -236,10 +279,12 @@ class DeepDCTVO(nn.Module):
         else:
             self.depth_model = LiteMonoDepthBranch(
                 checkpoint_dir=depth_checkpoint_dir,
-                model_name=depth_model_name,
+                model_name=self.depth_model_name,
                 feed_size=depth_feed_size,
-                output_mode="normalized_depth",
-                normalization_depth=depth_normalization_meters,
+                output_mode=self.depth_output_mode,
+                normalization_depth=(
+                    self.depth_normalization_meters
+                ),
                 freeze_pretrained=freeze_depth,
             )
 

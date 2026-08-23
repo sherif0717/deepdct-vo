@@ -571,6 +571,58 @@ def resolve_evaluation_configuration(
             args.translation_loss_weight
         )
 
+    use_semantic_cues = bool(
+        configuration.get(
+            "use_semantic_cues",
+            False,
+        )
+    )
+
+    use_depth_cues = bool(
+        configuration.get(
+            "use_depth_cues",
+            False,
+        )
+    )
+
+    checkpoint_uses_gt_rotation = bool(
+        configuration.get(
+            "use_ground_truth_rotation",
+            False,
+        )
+    )
+
+    is_track_a_a4 = (
+        checkpoint_uses_gt_rotation
+        and use_semantic_cues
+        and use_depth_cues
+    )
+
+    if is_track_a_a4:
+        if pose_loss_type != "mae":
+            raise ValueError(
+                "A4 checkpoint invariant failed: "
+                "pose_loss_type must be 'mae'."
+            )
+
+        if not math.isclose(
+            rotation_normalization_scale,
+            0.175,
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        ):
+            raise ValueError(
+                "A4 checkpoint invariant failed: "
+                "rotation_normalization_scale must be 0.175."
+            )
+
+        if semantic_map_mode != "foreground_probability":
+            raise ValueError(
+                "A4 checkpoint invariant failed: "
+                "semantic_map_mode must be "
+                "'foreground_probability'."
+            )
+
     return {
         "height": height,
         "width": width,
@@ -613,6 +665,12 @@ def resolve_evaluation_configuration(
         "depth_output_mode": configuration.get(
             "depth_output_mode",
             "normalized_depth",
+        ),
+        "depth_normalization_meters": float(
+            configuration.get(
+                "depth_normalization_meters",
+                80.0,
+            )
         ),
         "translation_decoder": str(
             configuration.get(
@@ -676,6 +734,28 @@ def resolve_evaluation_configuration(
 
         "rotation_geometry_supervision": (
             rotation_geometry_supervision
+        ),
+        "semantic_model": str(
+            configuration.get(
+                "semantic_model",
+                "lraspp",
+            )
+        ),
+
+        "depth_model": str(
+            configuration.get(
+                "depth_model",
+                "lite_mono",
+            )
+        ),
+        "use_ground_truth_rotation": (
+            checkpoint_uses_gt_rotation
+        ),
+        "use_semantic_cues": (
+            use_semantic_cues
+        ),
+        "use_depth_cues": (
+            use_depth_cues
         ),
     }
 
@@ -802,9 +882,18 @@ def build_model(
             evaluation_configuration["depth_model_name"]
         ),
         depth_output_mode=str(
-            evaluation_configuration["depth_output_mode"]
+            evaluation_configuration[
+                "depth_output_mode"
+            ]
+        ),
+        depth_normalization_meters=float(
+            evaluation_configuration[
+                "depth_normalization_meters"
+            ]
         ),
         freeze_depth=True,
+        freeze_semantic_model=True,
+        freeze_depth_model=True,
     )
 
     model.load_state_dict(
@@ -2847,6 +2936,44 @@ def print_summary(
         f"Depth cues:             "
         f"{bool(evaluation_configuration['use_depth_cues'])}"
     )
+    
+    if bool(
+        evaluation_configuration[
+            "use_semantic_cues"
+        ]
+    ):
+        print(
+            "Semantic auxiliary: LR-ASPP"
+        )
+
+        print(
+            "Semantic map mode: "
+            f"{evaluation_configuration['semantic_map_mode']}"
+        )
+
+    if bool(
+        evaluation_configuration[
+            "use_depth_cues"
+        ]
+    ):
+        print(
+            "Depth auxiliary:    Lite-Mono"
+        )
+
+        print(
+            "Depth model:        "
+            f"{evaluation_configuration['depth_model_name']}"
+        )
+
+        print(
+            "Depth output:       "
+            f"{evaluation_configuration['depth_output_mode']}"
+        )
+
+        print(
+            "Depth normalization:"
+            f" {float(evaluation_configuration['depth_normalization_meters']):.1f} m"
+        )
 
     print(
         f"Translation decoder:    "

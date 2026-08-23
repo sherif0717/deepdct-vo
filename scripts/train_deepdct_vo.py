@@ -535,6 +535,17 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--depth-normalization-meters",
+        type=float,
+        default=80.0,
+        help=(
+            "Maximum depth in meters used by Lite-Mono when "
+            "--depth-output-mode normalized_depth is selected. "
+            "Track-A A4 uses 80.0."
+        ),
+    )
+
+    parser.add_argument(
         "--init-checkpoint",
         type=Path,
         default=None,
@@ -858,6 +869,11 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "--rotation-normalization-scale must be greater than zero."
         )
+    
+    if args.depth_normalization_meters <= 0.0:
+        raise ValueError(
+            "--depth-normalization-meters must be greater than zero."
+        )
 
     if (
         args.pose_loss_type == "mae"
@@ -900,12 +916,26 @@ def validate_args(args: argparse.Namespace) -> None:
             )
         
     # --------------------------------------------------------------
-    # Track-A A3 invariants
+    # Track-A A3 / A4 invariants
+    #
+    # A3:
+    #   MAE
+    #   rotation scale = 0.175
+    #   dense Model T
+    #   GT physical rotation -> Model T
+    #   semantic OFF
+    #   depth OFF
+    #
+    # A4:
+    #   inherits all A3 settings
+    #   semantic ON  -> pretrained frozen LR-ASPP
+    #   depth ON     -> frozen Lite-Mono
     # --------------------------------------------------------------
     if args.use_ground_truth_rotation:
         if args.pose_loss_type != "mae":
             raise ValueError(
-                "Track-A A3 requires --pose-loss-type mae."
+                "Track-A A3/A4 requires "
+                "--pose-loss-type mae."
             )
 
         if not math.isclose(
@@ -915,33 +945,98 @@ def validate_args(args: argparse.Namespace) -> None:
             abs_tol=1.0e-12,
         ):
             raise ValueError(
-                "Track-A A3 requires "
+                "Track-A A3/A4 requires "
                 "--rotation-normalization-scale 0.175."
             )
 
         if args.translation_decoder != "dense":
             raise ValueError(
-                "Track-A A3 requires "
+                "Track-A A3/A4 requires "
                 "--translation-decoder dense."
             )
 
-        if args.use_semantic_cues:
+        if args.rotation_geometry_weight != 0.0:
             raise ValueError(
-                "Track-A A3 must keep semantic cues disabled. "
-                "Semantic/depth auxiliaries belong to A4."
-            )
-
-        if args.use_depth_cues:
-            raise ValueError(
-                "Track-A A3 must keep depth cues disabled. "
-                "Semantic/depth auxiliaries belong to A4."
+                "Track-A A3/A4 must keep experimental "
+                "rotation-geometry supervision disabled."
             )
 
         if args.init_checkpoint is not None:
             raise ValueError(
-                "Track-A A3 is a clean training run and must not "
+                "Track-A A3/A4 are clean training runs and must not "
                 "use --init-checkpoint."
             )
+
+        # ----------------------------------------------------------
+        # Cue pairing distinguishes A3 from A4.
+        #
+        # A3: semantic=False, depth=False
+        # A4: semantic=True,  depth=True
+        #
+        # Do not permit semantic-only or depth-only configurations
+        # inside the controlled Track-A reproduction progression.
+        # ----------------------------------------------------------
+        if (
+            args.use_semantic_cues
+            != args.use_depth_cues
+        ):
+            raise ValueError(
+                "Track-A A3/A4 requires semantic and depth cues "
+                "to be enabled or disabled together. "
+                "A3 uses both OFF; A4 uses both ON."
+            )
+
+        is_track_a_a4 = (
+            args.use_semantic_cues
+            and args.use_depth_cues
+        )
+
+        if is_track_a_a4:
+            if not args.pretrained_semantic:
+                raise ValueError(
+                    "Track-A A4 requires pretrained LR-ASPP."
+                )
+
+            if not args.freeze_semantic:
+                raise ValueError(
+                    "Track-A A4 requires frozen LR-ASPP. "
+                    "Use --freeze-semantic."
+                )
+
+            if not args.freeze_depth:
+                raise ValueError(
+                    "Track-A A4 requires frozen Lite-Mono. "
+                    "Use --freeze-depth."
+                )
+
+            if args.depth_model_name != "lite-mono-tiny":
+                raise ValueError(
+                    "Track-A A4 is fixed to "
+                    "--depth-model-name lite-mono-tiny."
+                )
+
+            if args.depth_output_mode != "normalized_depth":
+                raise ValueError(
+                    "Track-A A4 requires "
+                    "--depth-output-mode normalized_depth."
+                )
+
+            if not math.isclose(
+                args.depth_normalization_meters,
+                80.0,
+                rel_tol=0.0,
+                abs_tol=1.0e-12,
+            ):
+                raise ValueError(
+                    "Track-A A4 requires "
+                    "--depth-normalization-meters 80.0."
+                )
+
+            if args.semantic_map_mode != "foreground_probability":
+                raise ValueError(
+                    "Track-A A4 requires "
+                    "--semantic-map-mode foreground_probability."
+                )
 
     if args.translation_loss_weight < 0:
         raise ValueError(
@@ -1470,10 +1565,30 @@ def build_model(
         ),
         depth_checkpoint_dir=depth_checkpoint_dir,
         depth_model_name=args.depth_model_name,
-        depth_output_mode=args.depth_output_mode,
-        freeze_depth=args.freeze_depth,
-        use_semantic_cues=args.use_semantic_cues,
-        use_depth_cues=args.use_depth_cues,
+        depth_output_mode=(
+            args.depth_output_mode
+        ),
+        depth_normalization_meters=(
+            args.depth_normalization_meters
+        ),
+        freeze_depth=(
+            args.freeze_depth
+        ),
+        use_semantic_cues=(
+            args.use_semantic_cues
+        ),
+        use_depth_cues=(
+            args.use_depth_cues
+        ),
+
+        # Keep DeepDCTVO.train() synchronized with the actual
+        # auxiliary branch freeze policy.
+        freeze_semantic_model=(
+            args.freeze_semantic
+        ),
+        freeze_depth_model=(
+            args.freeze_depth
+        ),
     )
 
     return model.to(device)
@@ -1918,6 +2033,48 @@ def save_checkpoint(
             }
         )
 
+    if (
+        args.use_ground_truth_rotation
+        and args.use_semantic_cues
+        and args.use_depth_cues
+    ):
+        experiment_type = (
+            "track_a_a4_lraspp_litemono"
+        )
+
+    elif args.use_ground_truth_rotation:
+        experiment_type = (
+            "track_a_a3_gt_rotation_model_t"
+        )
+
+    elif args.rotation_readout_only:
+        experiment_type = (
+            "frozen_rotation_representation_linear_readout"
+        )
+
+    elif args.translation_head_only:
+        if args.translation_decoder == "pooled_linear":
+            experiment_type = (
+                "frozen_representation_linear_readout"
+            )
+        else:
+            experiment_type = (
+                "translation_head_only_finetune"
+            )
+
+    elif args.rotation_geometry_weight > 0.0:
+        experiment_type = (
+            "continuous_so3_rotation_geometry"
+        )
+
+    elif warm_start_metadata is not None:
+        experiment_type = (
+            "warm_start_cue_adaptation"
+        )
+
+    else:
+        experiment_type = "standard_training"
+
     checkpoint: Dict[str, object] = {
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
@@ -1938,32 +2095,7 @@ def save_checkpoint(
         "experiment": {
             "name": args.experiment_name,
             "source_experiment": args.source_experiment,
-            "experiment_type": (
-                "track_a_a3_gt_rotation_model_t"
-                if args.use_ground_truth_rotation
-                else (
-                    "frozen_rotation_representation_linear_readout"
-                    if args.rotation_readout_only
-                    else (
-                        (
-                            "frozen_representation_linear_readout"
-                            if args.translation_decoder
-                            == "pooled_linear"
-                            else "translation_head_only_finetune"
-                        )
-                        if args.translation_head_only
-                        else (
-                            "continuous_so3_rotation_geometry"
-                            if args.rotation_geometry_weight > 0.0
-                            else (
-                                "warm_start_cue_adaptation"
-                                if warm_start_metadata is not None
-                                else "standard_training"
-                            )
-                        )
-                    )
-                )
-            ),
+            "experiment_type": experiment_type,
             "trainable_parameters": (
                 sorted(
                     name
@@ -2032,6 +2164,29 @@ def save_checkpoint(
             ),
             "depth_output_mode": (
                 args.depth_output_mode
+                if args.use_depth_cues
+                else None
+            ),
+            "semantic_model": (
+                "lraspp"
+                if args.use_semantic_cues
+                else None
+            ),
+
+            "semantic_map_mode": (
+                args.semantic_map_mode
+                if args.use_semantic_cues
+                else None
+            ),
+
+            "depth_model": (
+                "lite_mono"
+                if args.use_depth_cues
+                else None
+            ),
+
+            "depth_normalization_meters": (
+                args.depth_normalization_meters
                 if args.use_depth_cues
                 else None
             ),
@@ -2202,7 +2357,11 @@ def save_checkpoint(
             "freeze_depth": (
                 args.freeze_depth
             ),
-
+            "depth_normalization_meters": (
+                args.depth_normalization_meters
+            ),
+            "semantic_model": "lraspp",
+            "depth_model": "lite_mono",
             # Reproducibility
             "seed": args.seed,
             "device": str(
@@ -2353,7 +2512,17 @@ def print_run_summary(
         f"{'GROUND TRUTH' if args.use_ground_truth_rotation else 'PREDICTED'}"
     )
 
-    if args.use_ground_truth_rotation:
+    if (
+        args.use_ground_truth_rotation
+        and args.use_semantic_cues
+        and args.use_depth_cues
+    ):
+        print(
+            "Track-A stage:         "
+            "A4 LR-ASPP + Lite-Mono auxiliaries"
+        )
+
+    elif args.use_ground_truth_rotation:
         print(
             "Track-A stage:         "
             "A3 GT rotation -> Model T"
@@ -2492,6 +2661,17 @@ def print_run_summary(
         f"{args.use_semantic_cues}"
     )
 
+    if args.use_semantic_cues:
+        print(
+            "Semantic auxiliary:   "
+            "LR-ASPP"
+        )
+
+        print(
+            f"Semantic map mode:    "
+            f"{args.semantic_map_mode}"
+        )
+
     print(
         f"Depth cues:           "
         f"{args.use_depth_cues}"
@@ -2519,6 +2699,15 @@ def print_run_summary(
         print(
             f"Depth output mode:    "
             f"{args.depth_output_mode}"
+        )
+        print(
+            "Depth auxiliary:      "
+            "Lite-Mono"
+        )
+
+        print(
+            f"Depth normalization:  "
+            f"{args.depth_normalization_meters:.1f} m"
         )
     else:
         print(

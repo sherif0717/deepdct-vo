@@ -518,7 +518,7 @@ def test_external_depth_bypasses_internal_depth_model():
     assert outputs["depth_was_supplied"].item() is True
 
 
-def test_deepdct_vo_with_real_lite_mono_depth():
+def test_deepdct_vo_internal_depth_path():
     model = DeepDCTVO(
         aresunet_output_channels=1,
         input_size=(32, 32),
@@ -583,6 +583,186 @@ def test_internal_depth_model_is_used_when_depth_not_supplied(
 
     assert outputs["depth_was_supplied"].item() is False
 
+def test_a4_uses_internal_semantic_and_depth_cues(
+    model,
+    inputs,
+):
+    image_prev, image_curr, _ = inputs
+
+    model.use_semantic_cues = True
+    model.use_depth_cues = True
+
+    model.semantic_model = DummySemanticBranch()
+    model.depth_model = DummyDepthBranch()
+
+    model.rotation_normalization_scale = 0.175
+
+    rotation_gt = torch.tensor(
+        [
+            [0.010, -0.020, 0.030],
+            [-0.040, 0.050, -0.060],
+        ],
+        dtype=image_curr.dtype,
+    )
+
+    with torch.no_grad():
+        outputs = model(
+            image_prev=image_prev,
+            image_curr=image_curr,
+            depth_curr=None,
+            rotation_for_translation=rotation_gt,
+            use_ground_truth_rotation=True,
+            return_intermediates=True,
+        )
+
+    expected_semantic_prev = (
+        image_prev
+        .mean(dim=1, keepdim=True)
+        .clamp(0.0, 1.0)
+    )
+
+    expected_semantic_curr = (
+        image_curr
+        .mean(dim=1, keepdim=True)
+        .clamp(0.0, 1.0)
+    )
+
+    expected_depth_curr = (
+        image_curr
+        .mean(dim=1, keepdim=True)
+        .clamp(0.0, 1.0)
+    )
+
+    assert torch.allclose(
+        outputs["semantic_prev"],
+        expected_semantic_prev,
+    )
+
+    assert torch.allclose(
+        outputs["semantic_curr"],
+        expected_semantic_curr,
+    )
+
+    assert torch.allclose(
+        outputs["depth_curr"],
+        expected_depth_curr,
+    )
+
+    assert (
+        outputs["semantic_cues_enabled"].item()
+        is True
+    )
+
+    assert (
+        outputs["depth_cues_enabled"].item()
+        is True
+    )
+
+    assert (
+        outputs["depth_was_supplied"].item()
+        is False
+    )
+
+    # A4 inherits A3:
+    # Model T must still receive exact physical GT rotation.
+    assert torch.equal(
+        outputs[
+            "rotation_used_for_translation"
+        ],
+        rotation_gt,
+    )
+
+    assert torch.equal(
+        outputs["rotation_map"][:, :, 0, 0],
+        rotation_gt,
+    )
+
+def test_a4_fusion_contains_semantic_depth_and_gt_rotation(
+    model,
+    inputs,
+):
+    image_prev, image_curr, _ = inputs
+
+    model.use_semantic_cues = True
+    model.use_depth_cues = True
+    model.semantic_model = DummySemanticBranch()
+    model.depth_model = DummyDepthBranch()
+
+    rotation_gt = torch.tensor(
+        [
+            [0.01, 0.02, 0.03],
+            [-0.01, -0.02, -0.03],
+        ],
+        dtype=image_curr.dtype,
+    )
+
+    with torch.no_grad():
+        outputs = model(
+            image_prev=image_prev,
+            image_curr=image_curr,
+            depth_curr=None,
+            rotation_for_translation=rotation_gt,
+            use_ground_truth_rotation=True,
+            return_intermediates=True,
+        )
+
+    # RGB + 1 semantic channel.
+    assert outputs["ci_prev"].shape == (
+        2,
+        4,
+        120,
+        120,
+    )
+
+    assert outputs["ci_curr"].shape == (
+        2,
+        4,
+        120,
+        120,
+    )
+
+    # Model R:
+    # C_prev + C_curr + S_curr + D_curr
+    assert outputs["rotation_features"].shape == (
+        2,
+        4,
+        120,
+        120,
+    )
+
+    # Model T:
+    # C_prev + C_curr + S_curr + D_curr + 3-D rotation map
+    assert outputs["translation_features"].shape == (
+        2,
+        7,
+        120,
+        120,
+    )
+
+    assert torch.equal(
+        outputs["rotation_map"][:, :, 0, 0],
+        rotation_gt,
+    )
+
+def test_a4_frozen_auxiliaries_remain_in_eval_mode(
+    model,
+):
+    model.freeze_semantic_model = True
+    model.freeze_depth_model = True
+
+    model.train()
+
+    assert model.training is True
+
+    assert (
+        model.semantic_model.training
+        is False
+    )
+
+    assert (
+        model.depth_model.training
+        is False
+    )
 
 def test_depth_placeholder_is_zero_when_depth_cues_disabled(
     model,
