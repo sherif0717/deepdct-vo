@@ -157,6 +157,29 @@ def parse_args() -> argparse.Namespace:
         help="KITTI sequences used for validation.",
     )
 
+    # ------------------------------------------------------------------
+    # Track-A A6: source-only training protocol
+    #
+    # When enabled:
+    #   - train only on --train-sequences
+    #   - do not construct a validation dataset
+    #   - do not run validate_one_epoch()
+    #   - do not use validation-driven LR scheduling
+    #   - do not use validation-driven early stopping
+    #   - do not create best_validation.pt
+    #
+    # The final fixed epoch / latest.pt becomes the selected A6 model.
+    # ------------------------------------------------------------------
+    parser.add_argument(
+        "--no-validation",
+        action="store_true",
+        help=(
+            "Disable validation completely. Intended for Track-A A6 "
+            "source-only training where target sequences 09 and 10 "
+            "must remain unseen until final evaluation."
+        ),
+    )
+
     parser.add_argument(
         "--camera",
         choices=[
@@ -1086,17 +1109,68 @@ def validate_args(args: argparse.Namespace) -> None:
         )
 
     training_sequences = set(args.train_sequences)
-    validation_sequences = set(args.validation_sequences)
 
-    overlap = training_sequences.intersection(
-        validation_sequences
-    )
+    if args.no_validation:
+        # --------------------------------------------------------------
+        # Track-A A6 invariant.
+        #
+        # A6 is specifically:
+        #
+        #     train: 00-08
+        #     test:  09 and 10
+        #
+        # Neither target sequence may participate in training.
+        # --------------------------------------------------------------
+        expected_a6_training_sequences = {
+            "00",
+            "01",
+            "02",
+            "03",
+            "04",
+            "05",
+            "06",
+            "07",
+            "08",
+        }
 
-    if overlap:
-        raise ValueError(
-            "Training and validation sequences must be disjoint. "
-            f"Overlap: {sorted(overlap)}."
+        if training_sequences != expected_a6_training_sequences:
+            raise ValueError(
+                "Track-A A6 --no-validation mode requires exactly "
+                "training sequences 00-08. "
+                f"Received: {sorted(training_sequences)}."
+            )
+
+        forbidden_target_sequences = {
+            "09",
+            "10",
+        }
+
+        leaked_targets = (
+            training_sequences
+            & forbidden_target_sequences
         )
+
+        if leaked_targets:
+            raise ValueError(
+                "Track-A A6 target leakage: sequences 09 and 10 "
+                "must remain unseen during training. "
+                f"Found: {sorted(leaked_targets)}."
+            )
+
+    else:
+        validation_sequences = set(
+            args.validation_sequences
+        )
+
+        overlap = training_sequences.intersection(
+            validation_sequences
+        )
+
+        if overlap:
+            raise ValueError(
+                "Training and validation sequences must be disjoint. "
+                f"Overlap: {sorted(overlap)}."
+            )
 
     if (
         not args.pretrained_semantic
@@ -1959,8 +2033,8 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler: ReduceLROnPlateau,
     training_metrics: EpochMetrics,
-    validation_metrics: ValidationMetrics,
-    best_validation_loss: float,
+    validation_metrics: Optional[ValidationMetrics],
+    best_validation_loss: Optional[float],
     args: argparse.Namespace,
     warm_start_metadata: Optional[
         Dict[str, Any]
@@ -2033,7 +2107,12 @@ def save_checkpoint(
             }
         )
 
-    if (
+    if args.no_validation:
+        experiment_type = (
+            "track_a_a6_unseen_00_08_to_09_10"
+        )
+
+    elif (
         args.use_ground_truth_rotation
         and args.use_semantic_cues
         and args.use_depth_cues
@@ -2081,8 +2160,18 @@ def save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "training_metrics": training_metrics.as_dict(),
-        "validation_metrics": validation_metrics.as_dict(),
-        "best_validation_loss": best_validation_loss,
+
+        "validation_metrics": (
+            validation_metrics.as_dict()
+            if validation_metrics is not None
+            else None
+        ),
+
+        "best_validation_loss": (
+            float(best_validation_loss)
+            if best_validation_loss is not None
+            else None
+        ),
         "rotation_geometry_state": (
             rotation_geometry_loss_fn.state_dict()
             if rotation_geometry_loss_fn is not None
@@ -2202,8 +2291,30 @@ def save_checkpoint(
             "train_sequences": list(
                 args.train_sequences
             ),
-            "validation_sequences": list(
-                args.validation_sequences
+
+            "validation_sequences": (
+                []
+                if args.no_validation
+                else list(args.validation_sequences)
+            ),
+
+            # ----------------------------------------------------------
+            # Track-A A6 protocol metadata
+            # ----------------------------------------------------------
+            "validation_enabled": (
+                not args.no_validation
+            ),
+
+            "checkpoint_selection": (
+                "final_epoch"
+                if args.no_validation
+                else "best_validation"
+            ),
+
+            "track_a_protocol": (
+                "A6_unseen_00_08_to_09_10"
+                if args.no_validation
+                else None
             ),
             "sampling_strategy": (
                 args.sampling_strategy
@@ -2392,7 +2503,9 @@ def print_run_summary(
     args: argparse.Namespace,
     device: torch.device,
     training_dataset: DeepDCTTrainingDataset,
-    validation_dataset: DeepDCTTrainingDataset,
+    validation_dataset: Optional[
+        DeepDCTTrainingDataset
+    ],
     model: nn.Module,
     warm_start_metadata: Optional[
         Mapping[str, Any]
@@ -2435,14 +2548,36 @@ def print_run_summary(
     print(f"Device:               {device}")
     print(f"Data root:            {args.data_root.resolve()}")
     print(f"Training sequences:   {args.train_sequences}")
+    if args.no_validation:
+        print(
+            "Validation sequences: NONE "
+            "(Track-A A6 source-only protocol)"
+        )
+        print(
+            "Checkpoint selection: final epoch / latest.pt"
+        )
+        print(
+            "Target sequences:     09, 10 — unseen during training"
+        )
+    else:
+        print(
+            f"Validation sequences: "
+            f"{args.validation_sequences}"
+        )
     print(
-        f"Validation sequences: "
-        f"{args.validation_sequences}"
+        f"Training samples:     "
+        f"{len(training_dataset)}"
     )
-    print(f"Training samples:     {len(training_dataset)}")
-    print(
-        f"Validation samples:   {len(validation_dataset)}"
-    )
+
+    if validation_dataset is None:
+        print(
+            "Validation samples:   NONE"
+        )
+    else:
+        print(
+            f"Validation samples:   "
+            f"{len(validation_dataset)}"
+        )
     print(
         f"Input size:           "
         f"{args.height} x {args.width}"
@@ -2720,7 +2855,7 @@ def print_run_summary(
 def print_epoch_summary(
     epoch: int,
     training_metrics: EpochMetrics,
-    validation_metrics: ValidationMetrics,
+    validation_metrics: Optional[ValidationMetrics],
     learning_rate: float,
     is_best: bool,
 ) -> None:
@@ -2749,29 +2884,37 @@ def print_epoch_summary(
         f"{training_metrics.translation_loss:.6f}"
     )
     print(
-        f"Validation total loss:  "
-        f"{validation_metrics.total_loss:.6f}"
-    )
-    print(
-        f"Validation rotation:    "
-        f"{validation_metrics.rotation_loss:.6f}"
-    )
-    print(
-        f"Validation rot geometry:  "
-        f" {validation_metrics.rotation_geometry_loss:.6f}"
-    )
-    print(
-        f"Validation translation: "
-        f"{validation_metrics.translation_loss:.6f}"
-    )
-    print(
         f"Train time:              "
         f"{training_metrics.elapsed_seconds:.2f} s"
     )
-    print(
-        f"Validation time:         "
-        f"{validation_metrics.elapsed_seconds:.2f} s"
-    )
+
+    if validation_metrics is not None:
+        print(
+            f"Validation total loss:  "
+            f"{validation_metrics.total_loss:.6f}"
+        )
+        print(
+            f"Validation rotation:    "
+            f"{validation_metrics.rotation_loss:.6f}"
+        )
+        print(
+            f"Validation rot geometry:  "
+            f" {validation_metrics.rotation_geometry_loss:.6f}"
+        )
+        print(
+            f"Validation translation: "
+            f"{validation_metrics.translation_loss:.6f}"
+        )
+        print(
+            f"Validation time:         "
+            f"{validation_metrics.elapsed_seconds:.2f} s"
+        )
+    else:
+        print(
+            "Validation:             DISABLED "
+            "(Track-A A6 source-only protocol)"
+        )
+
     print(f"Learning rate:           {learning_rate:.8f}")
     print("-" * 72)
     print()
@@ -3392,10 +3535,17 @@ def main() -> None:
         sequences=args.train_sequences,
     )
 
-    validation_dataset = build_dataset(
-        args=args,
-        sequences=args.validation_sequences,
-    )
+    validation_dataset: Optional[
+        DeepDCTTrainingDataset
+    ]
+
+    if args.no_validation:
+        validation_dataset = None
+    else:
+        validation_dataset = build_dataset(
+            args=args,
+            sequences=args.validation_sequences,
+        )
 
     translation_regime_configuration = None
 
@@ -3484,13 +3634,18 @@ def main() -> None:
         sampler=training_sampler,
     )
 
-    validation_loader = build_dataloader(
-        dataset=validation_dataset,
-        args=args,
-        device=device,
-        shuffle=False,
-        sampler=None,
-    )
+    validation_loader: Optional[DataLoader]
+
+    if validation_dataset is None:
+        validation_loader = None
+    else:
+        validation_loader = build_dataloader(
+            dataset=validation_dataset,
+            args=args,
+            device=device,
+            shuffle=False,
+            sampler=None,
+        )
 
     model = build_model(
         args=args,
@@ -3723,7 +3878,12 @@ def main() -> None:
     )
 
     start_epoch = 1
-    best_validation_loss = float("inf")
+
+    best_validation_loss: Optional[float] = (
+        None
+        if args.no_validation
+        else float("inf")
+    )
 
     # --------------------------------------------------------------
     # Continuous SO(3)-supervised rotation-geometry loss.
@@ -3757,12 +3917,41 @@ def main() -> None:
 
         start_epoch = resumed_epoch + 1
 
-        best_validation_loss = float(
-            checkpoint.get(
-                "best_validation_loss",
-                float("inf"),
+        if args.no_validation:
+            best_validation_loss = None
+        else:
+            best_validation_loss = float(
+                checkpoint.get(
+                    "best_validation_loss",
+                    float("inf"),
+                )
             )
+
+        resume_configuration = checkpoint.get(
+            "configuration",
+            {},
         )
+
+        if args.no_validation:
+            if not isinstance(
+                resume_configuration,
+                Mapping,
+            ):
+                raise TypeError(
+                    "A6 resume checkpoint configuration "
+                    "must be a mapping."
+                )
+
+            if bool(
+                resume_configuration.get(
+                    "validation_enabled",
+                    True,
+                )
+            ):
+                raise ValueError(
+                    "Cannot resume an A6 --no-validation run "
+                    "from a validation-selected checkpoint."
+                )
 
         print(
             f"Resumed from {args.resume} at epoch "
@@ -3862,63 +4051,94 @@ def main() -> None:
 
         )
 
-        validation_metrics = validate_one_epoch(
-            model=model,
-            dataloader=validation_loader,
-            device=device,
-            rotation_criterion=rotation_criterion,
-            translation_criterion=translation_criterion,
-            rotation_loss_weight=(
-                args.rotation_loss_weight
-            ),
-            translation_loss_weight=(
-                args.translation_loss_weight
-            ),
-            use_ground_truth_rotation=(
-                args.use_ground_truth_rotation
-            ),
-            log_interval=args.log_interval,
-            epoch_index=epoch,
-            skip_nonfinite_batches=(
-                args.skip_nonfinite_batches
-            ),
-            use_internal_depth=(
-                args.use_depth_cues
-            ),
-            rotation_geometry_weight=(
-                args.rotation_geometry_weight
-            ),
-            rotation_geometry_loss_fn=(
-                rotation_geometry_loss_fn
-            ),
-        )
+        # --------------------------------------------------------------
+        # Track-A A6:
+        #
+        # In source-only mode there is deliberately no validation pass.
+        # Sequences 09 and 10 remain completely unseen until final test.
+        # --------------------------------------------------------------
+        validation_metrics: Optional[
+            ValidationMetrics
+        ]
 
-        scheduler.step(
-            validation_metrics.total_loss
-        )
+        if args.no_validation:
+            validation_metrics = None
 
-        validation_improvement = (
-            best_validation_loss
-            - validation_metrics.total_loss
-        )
+            # No validation-selected checkpoint exists in A6.
+            is_best = False
 
-        is_best = (
-            validation_improvement
-            > args.early_stopping_min_delta
-        )
+            # Do NOT:
+            #   scheduler.step(...)
+            #   update best_validation_loss
+            #   update epochs_without_improvement
+            #
+            # A6 uses the predetermined final epoch.
 
-        if is_best:
-            best_validation_loss = (
-                validation_metrics.total_loss
-            )
-            epochs_without_improvement = 0
         else:
-            epochs_without_improvement += 1
+            if validation_loader is None:
+                raise RuntimeError(
+                    "Validation is enabled but validation_loader is None."
+                )
 
-        if is_best:
-            best_validation_loss = (
+            validation_metrics = validate_one_epoch(
+                model=model,
+                dataloader=validation_loader,
+                device=device,
+                rotation_criterion=rotation_criterion,
+                translation_criterion=translation_criterion,
+                rotation_loss_weight=(
+                    args.rotation_loss_weight
+                ),
+                translation_loss_weight=(
+                    args.translation_loss_weight
+                ),
+                use_ground_truth_rotation=(
+                    args.use_ground_truth_rotation
+                ),
+                log_interval=args.log_interval,
+                epoch_index=epoch,
+                skip_nonfinite_batches=(
+                    args.skip_nonfinite_batches
+                ),
+                use_internal_depth=(
+                    args.use_depth_cues
+                ),
+                rotation_geometry_weight=(
+                    args.rotation_geometry_weight
+                ),
+                rotation_geometry_loss_fn=(
+                    rotation_geometry_loss_fn
+                ),
+            )
+
+            scheduler.step(
                 validation_metrics.total_loss
             )
+
+            if best_validation_loss is None:
+                raise RuntimeError(
+                    "Validation is enabled but "
+                    "best_validation_loss is None."
+                )
+
+            validation_improvement = (
+                best_validation_loss
+                - validation_metrics.total_loss
+            )
+
+            is_best = (
+                validation_improvement
+                > args.early_stopping_min_delta
+            )
+
+            if is_best:
+                best_validation_loss = (
+                    validation_metrics.total_loss
+                )
+
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
 
         current_learning_rate = float(
             optimizer.param_groups[0]["lr"]
@@ -3967,7 +4187,10 @@ def main() -> None:
                 epoch_path,
             )
 
-        if is_best:
+        if (
+            not args.no_validation
+            and is_best
+        ):
             best_path = (
                 args.checkpoint_dir
                 / "best_validation.pt"
@@ -3988,7 +4211,8 @@ def main() -> None:
         )
 
         if (
-            args.early_stopping_patience > 0
+            not args.no_validation
+            and args.early_stopping_patience > 0
             and epochs_without_improvement
             >= args.early_stopping_patience
         ):

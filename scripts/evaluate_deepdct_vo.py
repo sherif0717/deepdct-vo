@@ -246,6 +246,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--require-a6-protocol",
+        action="store_true",
+        help=(
+            "Require checkpoint metadata to satisfy Track-A A6: "
+            "training sequences exactly 00-08, validation disabled, "
+            "and checkpoint selection by final fixed epoch."
+        ),
+    )
+
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=None,
@@ -498,6 +508,123 @@ def get_checkpoint_configuration(
 
     return configuration
 
+def validate_a6_checkpoint_protocol(
+    checkpoint: Mapping[str, object],
+) -> None:
+    """Verify that a checkpoint satisfies Track-A A6."""
+
+    configuration = get_checkpoint_configuration(
+        checkpoint
+    )
+
+    expected_training_sequences = {
+        "00",
+        "01",
+        "02",
+        "03",
+        "04",
+        "05",
+        "06",
+        "07",
+        "08",
+    }
+
+    target_sequences = {
+        "09",
+        "10",
+    }
+
+    train_sequences = {
+        str(sequence).zfill(2)
+        for sequence in configuration.get(
+            "train_sequences",
+            [],
+        )
+    }
+
+    validation_sequences = {
+        str(sequence).zfill(2)
+        for sequence in configuration.get(
+            "validation_sequences",
+            [],
+        )
+    }
+
+    if train_sequences != expected_training_sequences:
+        raise ValueError(
+            "A6 protocol check failed: checkpoint must "
+            "have been trained on exactly sequences 00-08. "
+            f"Checkpoint records: {sorted(train_sequences)}."
+        )
+
+    target_leakage = (
+        train_sequences
+        | validation_sequences
+    ) & target_sequences
+
+    if target_leakage:
+        raise ValueError(
+            "A6 protocol check failed: target sequence "
+            "leakage detected. Sequence(s) "
+            f"{sorted(target_leakage)} appear in training "
+            "or validation metadata."
+        )
+
+    validation_enabled = bool(
+        configuration.get(
+            "validation_enabled",
+            True,
+        )
+    )
+
+    if validation_enabled:
+        raise ValueError(
+            "A6 protocol check failed: checkpoint records "
+            "validation_enabled=True."
+        )
+
+    checkpoint_selection = str(
+        configuration.get(
+            "checkpoint_selection",
+            "",
+        )
+    )
+
+    if checkpoint_selection != "final_epoch":
+        raise ValueError(
+            "A6 protocol check failed: expected "
+            "checkpoint_selection='final_epoch', but received "
+            f"{checkpoint_selection!r}."
+        )
+
+    track_a_protocol = str(
+        configuration.get(
+            "track_a_protocol",
+            "",
+        )
+    )
+
+    if (
+        track_a_protocol
+        != "A6_unseen_00_08_to_09_10"
+    ):
+        raise ValueError(
+            "A6 protocol check failed: checkpoint does not "
+            "identify itself as "
+            "'A6_unseen_00_08_to_09_10'."
+        )
+
+    print("=" * 72)
+    print("Track-A A6 checkpoint protocol: PASS")
+    print("=" * 72)
+    print(
+        "Training sequences:    "
+        f"{sorted(train_sequences)}"
+    )
+    print("Validation sequences:  NONE")
+    print("Unseen targets:        09, 10")
+    print("Checkpoint selection:  final fixed epoch")
+    print("=" * 72)
 
 def resolve_evaluation_configuration(
     args: argparse.Namespace,
@@ -3215,10 +3342,53 @@ def main() -> None:
 
     device = resolve_device(args.device)
 
+    if (
+        args.require_a6_protocol
+        and args.sequence not in {
+            "09",
+            "10",
+        }
+    ):
+        raise ValueError(
+            "Track-A A6 evaluation targets must be "
+            "sequence 09 or sequence 10."
+        )
+    
+
+    if args.require_a6_protocol:
+        expected_translation_scales = {
+            "09": 0.975,
+            "10": 1.007,
+        }
+
+        expected_scale = (
+            expected_translation_scales[
+                args.sequence
+            ]
+        )
+
+        if not math.isclose(
+            args.translation_scale_factor,
+            expected_scale,
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        ):
+            raise ValueError(
+                "A6 inherited A5 scaling mismatch for "
+                f"sequence {args.sequence}: expected "
+                f"{expected_scale:.3f}, received "
+                f"{args.translation_scale_factor:.6f}."
+            )
+
     checkpoint = load_checkpoint(
         checkpoint_path=args.checkpoint,
         device=device,
     )
+
+    if args.require_a6_protocol:
+        validate_a6_checkpoint_protocol(
+            checkpoint
+        )
 
     evaluation_configuration = (
         resolve_evaluation_configuration(
@@ -3860,6 +4030,52 @@ def main() -> None:
             ),
         },
         "frame_metrics": asdict(aggregate_metrics),
+        # ------------------------------------------------------
+        # Track-A A6 evaluation protocol
+        # ------------------------------------------------------
+        "evaluation_protocol": {
+        "track_a_stage": (
+            "A6"
+            if args.require_a6_protocol
+            else None
+        ),
+
+        "protocol_name": (
+            "unseen_00_08_to_09_10"
+            if args.require_a6_protocol
+            else None
+        ),
+
+        "train_sequences": (
+            [
+                "00",
+                "01",
+                "02",
+                "03",
+                "04",
+                "05",
+                "06",
+                "07",
+                "08",
+            ]
+            if args.require_a6_protocol
+            else None
+        ),
+
+        "validation_enabled": (
+            False
+            if args.require_a6_protocol
+            else None
+        ),
+
+        "target_sequence": args.sequence,
+
+        "checkpoint_selection": (
+            "final_epoch"
+            if args.require_a6_protocol
+            else None
+        ),
+    },
 
         # ------------------------------------------------------
         # Track-A A5 post-processing configuration.
