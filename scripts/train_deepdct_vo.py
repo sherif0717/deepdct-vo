@@ -522,6 +522,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--depth-provider",
+        choices=("lite_mono", "monodepth2"),
+        default="lite_mono",
+        help="Internal monocular-depth implementation.",
+    )
+
+    parser.add_argument(
         "--depth-checkpoint-dir",
         type=Path,
         default=Path(
@@ -537,13 +544,11 @@ def parse_args() -> argparse.Namespace:
         "--depth-model-name",
         type=str,
         default="lite-mono-tiny",
-        choices=[
-            "lite-mono",
-            "lite-mono-small",
-            "lite-mono-tiny",
-            "lite-mono-8m",
-        ],
-        help="Lite-Mono architecture corresponding to the checkpoint.",
+        help=(
+            "Checkpoint/model identity: e.g. lite-mono-tiny or "
+            "mono_640x192. Architecture selection is controlled by "
+            "--depth-provider."
+        ),
     )
 
     parser.add_argument(
@@ -637,8 +642,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8,
         help=(
-            "Number of learned translation feature maps K used by "
-            "--translation-decoder pooled_mlp."
+            "Number of projected feature maps K used by pooled_mlp, "
+            "pooled_linear, and gated_expert translation decoders."
         ),
     )
 
@@ -649,8 +654,8 @@ def parse_args() -> argparse.Namespace:
         metavar=("HEIGHT", "WIDTH"),
         default=(4, 4),
         help=(
-            "Adaptive average-pooling output size used by "
-            "--translation-decoder pooled_mlp."
+                "Adaptive pooling output size PH PW used by pooled_mlp, "
+                "pooled_linear, and gated_expert translation decoders."
         ),
     )
 
@@ -972,10 +977,20 @@ def validate_args(args: argparse.Namespace) -> None:
                 "--rotation-normalization-scale 0.175."
             )
 
-        if args.translation_decoder != "dense":
+        allowed_gt_rotation_decoders = {
+            "dense",
+            "pooled_mlp",
+        }
+
+        if (
+            args.translation_decoder
+            not in allowed_gt_rotation_decoders
+        ):
             raise ValueError(
-                "Track-A A3/A4 requires "
-                "--translation-decoder dense."
+                "Ground-truth-rotation training supports "
+                "--translation-decoder dense for Track-A A3/A4 "
+                "or pooled_mlp for the compact translation "
+                "aggregation experiment."
             )
 
         if args.rotation_geometry_weight != 0.0:
@@ -1032,10 +1047,22 @@ def validate_args(args: argparse.Namespace) -> None:
                     "Use --freeze-depth."
                 )
 
-            if args.depth_model_name != "lite-mono-tiny":
+            if (
+                args.depth_provider == "lite_mono"
+                and args.depth_model_name != "lite-mono-tiny"
+            ):
                 raise ValueError(
-                    "Track-A A4 is fixed to "
+                    "The Lite-Mono Track-A baseline requires "
                     "--depth-model-name lite-mono-tiny."
+                )
+
+            if (
+                args.depth_provider == "monodepth2"
+                and args.depth_model_name != "mono_640x192"
+            ):
+                raise ValueError(
+                    "The A6 Monodepth2 comparison requires "
+                    "--depth-model-name mono_640x192."
                 )
 
             if args.depth_output_mode != "normalized_depth":
@@ -1637,6 +1664,7 @@ def build_model(
         translation_num_experts=(
             args.translation_num_experts
         ),
+        depth_provider=args.depth_provider,
         depth_checkpoint_dir=depth_checkpoint_dir,
         depth_model_name=args.depth_model_name,
         depth_output_mode=(
@@ -2116,6 +2144,16 @@ def save_checkpoint(
         args.use_ground_truth_rotation
         and args.use_semantic_cues
         and args.use_depth_cues
+        and args.translation_decoder == "pooled_mlp"
+    ):
+        experiment_type = (
+            "compact_translation_aggregation"
+        )
+
+    elif (
+        args.use_ground_truth_rotation
+        and args.use_semantic_cues
+        and args.use_depth_cues
     ):
         experiment_type = (
             "track_a_a4_lraspp_litemono"
@@ -2269,7 +2307,7 @@ def save_checkpoint(
             ),
 
             "depth_model": (
-                "lite_mono"
+                args.depth_provider
                 if args.use_depth_cues
                 else None
             ),
@@ -2426,9 +2464,6 @@ def save_checkpoint(
             "translation_num_experts": (
                 args.translation_num_experts
             ),
-            "translation_pool_size": (
-                args.translation_pool_size
-            ),
             "share_aresunet_between_models": (
                 args.share_aresunet_between_models
             ),
@@ -2472,7 +2507,8 @@ def save_checkpoint(
                 args.depth_normalization_meters
             ),
             "semantic_model": "lraspp",
-            "depth_model": "lite_mono",
+            "depth_provider": args.depth_provider,
+            "depth_model": args.depth_provider,
             # Reproducibility
             "seed": args.seed,
             "device": str(
@@ -2540,6 +2576,12 @@ def print_run_summary(
     total_parameters = sum(
         parameter.numel()
         for parameter in model.parameters()
+    )
+
+    depth_label = (
+        "Monodepth2"
+        if args.depth_provider == "monodepth2"
+        else "Lite-Mono"
     )
 
     print("=" * 72)
@@ -2654,7 +2696,9 @@ def print_run_summary(
     ):
         print(
             "Track-A stage:         "
-            "A4 LR-ASPP + Lite-Mono auxiliaries"
+            "A4 LR-ASPP + "
+            f"{depth_label}"  
+            " auxiliaries"
         )
 
     elif args.use_ground_truth_rotation:
@@ -2825,7 +2869,8 @@ def print_run_summary(
     if args.use_depth_cues:
         print(
             "Depth source:         "
-            "internal Lite-Mono"
+            "internal "
+            f"{depth_label}"
         )
         print(
             f"Depth checkpoint:     "
@@ -2837,7 +2882,7 @@ def print_run_summary(
         )
         print(
             "Depth auxiliary:      "
-            "Lite-Mono"
+            f"{depth_label}"
         )
 
         print(

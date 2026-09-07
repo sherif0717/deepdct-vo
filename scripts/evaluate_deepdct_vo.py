@@ -310,8 +310,30 @@ def parse_args() -> argparse.Namespace:
         "--use-ground-truth-rotation",
         action="store_true",
         help=(
-            "Condition Model T on ground-truth rotation. By default, "
-            "Model T uses predicted rotation, matching normal inference."
+            "Deprecated compatibility flag. Equivalent to "
+            "--model-t-rotation-source ground_truth."
+        ),
+    )
+
+    parser.add_argument(
+        "--model-t-rotation-source",
+        choices=["checkpoint", "predicted", "ground_truth"],
+        default="checkpoint",
+        help=(
+            "Rotation supplied to Model T. 'checkpoint' restores the "
+            "training configuration; 'predicted' forces Model-R output; "
+            "'ground_truth' performs GT-conditioned translation."
+        ),
+    )
+
+    parser.add_argument(
+        "--trajectory-rotation-source",
+        choices=["predicted", "ground_truth"],
+        default="predicted",
+        help=(
+            "Rotation used with predicted directional translation during "
+            "trajectory reconstruction. Use ground_truth for a clean "
+            "translation-only attribution and predicted for end-to-end VO."
         ),
     )
 
@@ -433,6 +455,58 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(
                 f"--{name.replace('_', '-')} cannot be negative."
             )
+
+
+def resolve_model_t_rotation_source(
+    requested_source: str,
+    checkpoint_uses_gt_rotation: bool,
+    legacy_use_ground_truth_rotation: bool = False,
+) -> str:
+    """Resolve the effective rotation source supplied to Model T."""
+
+    valid_sources = {"checkpoint", "predicted", "ground_truth"}
+
+    if requested_source not in valid_sources:
+        raise ValueError(
+            "Model-T rotation source must be one of "
+            f"{sorted(valid_sources)}, but received {requested_source!r}."
+        )
+
+    if legacy_use_ground_truth_rotation:
+        if requested_source == "predicted":
+            raise ValueError(
+                "--use-ground-truth-rotation conflicts with "
+                "--model-t-rotation-source predicted."
+            )
+        return "ground_truth"
+
+    if requested_source == "checkpoint":
+        return (
+            "ground_truth"
+            if checkpoint_uses_gt_rotation
+            else "predicted"
+        )
+
+    return requested_source
+
+
+def select_trajectory_rotations(
+    source: str,
+    rotation_gt: np.ndarray,
+    rotation_pred: np.ndarray,
+) -> np.ndarray:
+    """Select rotations used to reconstruct the predicted trajectory."""
+
+    if source == "ground_truth":
+        return rotation_gt
+
+    if source == "predicted":
+        return rotation_pred
+
+    raise ValueError(
+        "Trajectory rotation source must be 'predicted' or "
+        f"'ground_truth', but received {source!r}."
+    )
 
 
 def seed_everything(seed: int) -> None:
@@ -745,6 +819,18 @@ def resolve_evaluation_configuration(
         )
     )
 
+    depth_provider = str(
+        configuration.get(
+            "depth_provider",
+            configuration.get("depth_model", "lite_mono"),
+        )
+    ).lower().replace("-", "_")
+
+    if depth_provider not in {"lite_mono", "monodepth2"}:
+        raise ValueError(
+            f"Unsupported checkpoint depth provider: {depth_provider!r}."
+        )
+
     checkpoint_uses_gt_rotation = bool(
         configuration.get(
             "use_ground_truth_rotation",
@@ -815,6 +901,7 @@ def resolve_evaluation_configuration(
                 False,
             )
         ),
+        "depth_provider": depth_provider,
         "depth_checkpoint_dir": configuration.get(
             "depth_checkpoint_dir"
         ),
@@ -1032,6 +1119,9 @@ def build_model(
         ),
         use_depth_cues=bool(
             evaluation_configuration["use_depth_cues"]
+        ),
+        depth_provider=str(
+            evaluation_configuration["depth_provider"]
         ),
         depth_checkpoint_dir=(
             evaluation_configuration["depth_checkpoint_dir"]
@@ -3075,6 +3165,8 @@ def print_summary(
     trajectory_metrics: Optional[TrajectoryMetrics],
     unscaled_trajectory_metrics: Optional[TrajectoryMetrics],
     evaluation_configuration: Mapping[str, object],
+    model_t_rotation_source: str,
+    trajectory_rotation_source: str,
     translation_scale_factor: float,
     output_dir: Path,
 ) -> None:
@@ -3085,8 +3177,17 @@ def print_summary(
     print("DeepDCT-VO held-out test evaluation")
     print("=" * 72)
 
+    depth_provider = str(evaluation_configuration["depth_provider"])
+    depth_label = (
+        "Monodepth2"
+        if depth_provider == "monodepth2"
+        else "Lite-Mono"
+    )
+
     if bool(evaluation_configuration["use_depth_cues"]):
-        print("Depth source:           internal Lite-Mono")
+        print("Depth source:           internal " 
+              f"{depth_label}"
+              )
     else:
         print("Depth source:           dataset placeholder")
 
@@ -3119,7 +3220,8 @@ def print_summary(
         ]
     ):
         print(
-            "Depth auxiliary:    Lite-Mono"
+            "Depth auxiliary:    "
+            f"{depth_label}"
         )
 
         print(
@@ -3141,6 +3243,17 @@ def print_summary(
         f"Translation decoder:    "
         f"{evaluation_configuration['translation_decoder']}"
     )
+
+    if (
+        evaluation_configuration[
+            "translation_decoder"
+        ]
+        == "pooled_mlp"
+    ):
+        print(
+            "Aggregation hidden dim: "
+            f"{int(evaluation_configuration['translation_aggregation_hidden_dim'])}"
+        )
 
     if (
         evaluation_configuration[
@@ -3207,6 +3320,16 @@ def print_summary(
     print(
         f"Rotation norm scale:    "
         f"{float(evaluation_configuration['rotation_normalization_scale']):.6f}"
+    )
+
+    print(
+        f"Model-T rotation:       "
+        f"{model_t_rotation_source.upper()}"
+    )
+
+    print(
+        f"Trajectory rotation:    "
+        f"{trajectory_rotation_source.upper()}"
     )
 
     print(
@@ -3413,9 +3536,18 @@ def main() -> None:
         ]
     )
 
+    model_t_rotation_source = resolve_model_t_rotation_source(
+        requested_source=args.model_t_rotation_source,
+        checkpoint_uses_gt_rotation=(
+            checkpoint_uses_gt_rotation
+        ),
+        legacy_use_ground_truth_rotation=(
+            args.use_ground_truth_rotation
+        ),
+    )
+
     effective_use_ground_truth_rotation = (
-        checkpoint_uses_gt_rotation
-        or args.use_ground_truth_rotation
+        model_t_rotation_source == "ground_truth"
     )
 
     # --------------------------------------------------------------
@@ -3508,6 +3640,13 @@ def main() -> None:
                 f"but rebuilt model exposes "
                 f"{actual_rotation_representation_dim}."
             )
+        
+    depth_provider = str(evaluation_configuration["depth_provider"])
+    depth_label = (
+        "Monodepth2"
+        if depth_provider == "monodepth2"
+        else "Lite-Mono"
+    )
 
     print("=" * 72)
     print("DeepDCT-VO evaluation")
@@ -3527,7 +3666,9 @@ def main() -> None:
         f"{evaluation_configuration['camera']}"
     )
     if bool(evaluation_configuration["use_depth_cues"]):
-        print("Depth source:      internal Lite-Mono")
+        print("Depth source:      internal "
+              f"{depth_label}"
+              )
     else:
         print("Depth source:      dataset placeholder")
 
@@ -3601,14 +3742,15 @@ def main() -> None:
         f"{checkpoint_uses_gt_rotation}"
     )
 
-    if effective_use_ground_truth_rotation:
-        print(
-            "Model-T rotation source:   GROUND TRUTH"
-        )
-    else:
-        print(
-            "Model-T rotation source:   PREDICTED"
-        )
+    print(
+        "Model-T rotation source:   "
+        f"{model_t_rotation_source.upper()}"
+    )
+
+    print(
+        "Trajectory rotation source:"
+        f" {args.trajectory_rotation_source.upper()}"
+    )
     print("=" * 72)
 
     (
@@ -3828,8 +3970,14 @@ def main() -> None:
         # A5 control trajectory:
         # exact raw network output, identical to A4 behavior.
         # ------------------------------------------------------
+        trajectory_rotations = select_trajectory_rotations(
+            source=args.trajectory_rotation_source,
+            rotation_gt=rotation_gt,
+            rotation_pred=rotation_pred,
+        )
+
         unscaled_predicted_trajectory = integrate_relative_poses(
-            rotations=rotation_pred,
+            rotations=trajectory_rotations,
             translations=translation_pred,
             euler_order=args.euler_order,
             angles_in_degrees=args.angles_in_degrees,
@@ -3863,7 +4011,7 @@ def main() -> None:
             )
 
         predicted_trajectory = integrate_relative_poses(
-            rotations=rotation_pred,
+            rotations=trajectory_rotations,
             translations=postprocessed_translation_pred,
             euler_order=args.euler_order,
             angles_in_degrees=args.angles_in_degrees,
@@ -3994,6 +4142,23 @@ def main() -> None:
         "evaluation_configuration": dict(
             evaluation_configuration
         ),
+        "rotation_sources": {
+            "checkpoint_model_t_uses_ground_truth": (
+                checkpoint_uses_gt_rotation
+            ),
+            "requested_model_t_source": (
+                args.model_t_rotation_source
+            ),
+            "effective_model_t_source": (
+                model_t_rotation_source
+            ),
+            "trajectory_source": (
+                args.trajectory_rotation_source
+            ),
+            "legacy_gt_flag": bool(
+                args.use_ground_truth_rotation
+            ),
+        },
         "rotation_geometry": {
             "enabled": rotation_geometry_enabled,
             "weight": float(
@@ -4149,6 +4314,10 @@ def main() -> None:
             unscaled_trajectory_metrics
         ),
         evaluation_configuration=evaluation_configuration,
+        model_t_rotation_source=model_t_rotation_source,
+        trajectory_rotation_source=(
+            args.trajectory_rotation_source
+        ),
         translation_scale_factor=float(
             args.translation_scale_factor
         ),

@@ -439,7 +439,7 @@ class DirectionalTranslationHead(RegressionHead):
         }:
             raise ValueError(
                 "decoder_type must be one of "
-                "{'dense', 'mlp', 'pooled_mlp', 'gated_expert'}, "
+                "{'dense', 'mlp', 'pooled_mlp', "
                 "'pooled_linear', 'gated_expert'}, "
                 f"but received {decoder_type!r}."
             )
@@ -560,6 +560,10 @@ class DirectionalTranslationHead(RegressionHead):
                 self.projection_channels
                 * self.pool_size[0]
                 * self.pool_size[1]
+            )
+
+            self.representation_dim = int(
+                compact_size
             )
 
             self.dense = nn.Sequential(
@@ -711,6 +715,56 @@ class DirectionalTranslationHead(RegressionHead):
                 inplace=False,
             )
 
+    def extract_compact_representation(
+        self,
+        x: Tensor,
+    ) -> Tensor:
+        """Return the compact pooled translation representation."""
+
+        if self.decoder_type not in {
+            "pooled_mlp",
+            "pooled_linear",
+            "gated_expert",
+        }:
+            raise RuntimeError(
+                "Compact representation extraction requires "
+                "pooled_mlp, pooled_linear, or gated_expert, "
+                f"but decoder_type is {self.decoder_type!r}."
+            )
+
+        self._validate_input(x)
+
+        if x.shape[-2:] != self.input_size:
+            x = F.interpolate(
+                x,
+                size=self.input_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        x = self.conv(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+        x = self.pool(x)
+
+        representation = torch.flatten(
+            x,
+            start_dim=1,
+        )
+
+        if (
+            representation.ndim != 2
+            or representation.shape[1]
+            != self.representation_dim
+        ):
+            raise RuntimeError(
+                "Unexpected compact translation representation size. "
+                f"Expected [B, {self.representation_dim}], "
+                f"received {tuple(representation.shape)}."
+            )
+
+        return representation
+
     def forward(
         self,
         x: Tensor,
@@ -728,74 +782,25 @@ class DirectionalTranslationHead(RegressionHead):
         }:
             return super().forward(x)
 
-        # ----------------------------------------------------------
-        # pooled_mlp, pooled_linear, and gated_expert share the
-        # same structured representation extractor.
-        # ----------------------------------------------------------
-        self._validate_input(x)
-
-        if x.shape[-2:] != self.input_size:
-            x = F.interpolate(
-                x,
-                size=self.input_size,
-                mode="bilinear",
-                align_corners=False,
-            )
-
-        # Learned multi-channel translation projection.
-        x = self.conv(x)
-        x = self.relu(x)
-        x = self.dropout(x)
-
-        # Structured spatial aggregation.
-        x = self.pool(x)
-
-        # Compact representation.
-        #
-        # Default:
-        #
-        #   [B, 8, 4, 4]
-        #       ->
-        #   [B, 128]
-        representation = torch.flatten(
-            x,
-            start_dim=1,
+        representation = (
+            self.extract_compact_representation(x)
         )
 
-        if (
-            self.decoder_type == "gated_expert"
-            and representation.shape[1]
-            != self.representation_dim
-        ):
-            raise RuntimeError(
-                "Unexpected gated-expert representation size. "
-                f"Expected {self.representation_dim}, "
-                f"received {representation.shape[1]}."
-            )
-        
-        # ----------------------------------------------------------
-        # Frozen-representation linear readout.
-        # ----------------------------------------------------------
-        if self.decoder_type == "pooled_linear":
+        if self.decoder_type in {
+            "pooled_mlp",
+            "pooled_linear",
+            "gated_expert",
+        }:
             if (
-                representation.shape[1]
+                representation.ndim != 2
+                or representation.shape[1]
                 != self.representation_dim
             ):
                 raise RuntimeError(
-                    "Unexpected pooled-linear representation size. "
-                    f"Expected {self.representation_dim}, "
-                    f"received {representation.shape[1]}."
+                    "Unexpected compact translation representation size. "
+                    f"Expected [B, {self.representation_dim}], "
+                    f"received {tuple(representation.shape)}."
                 )
-
-            translation = self.dense(
-                representation
-            )
-
-            translation = self.output_activation(
-                translation
-            )
-
-            return translation
 
         # ----------------------------------------------------------
         # Existing structured-aggregation decoder.

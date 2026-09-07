@@ -15,6 +15,10 @@ import torch.nn as nn
 
 from deepdct.models.deepdct_vo import DeepDCTVO
 
+from deepdct.models.pose_head import (
+    DirectionalTranslationHead,
+)
+
 
 class DummySemanticBranch(nn.Module):
     """Fast deterministic substitute for LR-ASPP."""
@@ -582,6 +586,133 @@ def test_internal_depth_model_is_used_when_depth_not_supplied(
     )
 
     assert outputs["depth_was_supplied"].item() is False
+
+def test_pooled_mlp_translation_head_shape():
+    model = DeepDCTVO(
+        pretrained_semantic=False,
+        freeze_semantic=True,
+        depth_checkpoint_dir=None,
+        depth_model=DummyDepthBranch(),
+        use_semantic_cues=False,
+        use_depth_cues=False,
+        translation_decoder_type="pooled_mlp",
+        translation_projection_channels=8,
+        translation_pool_size=(4, 4),
+        translation_aggregation_hidden_dim=64,
+    )
+
+    model.semantic_model = DummySemanticBranch()
+    model.eval()
+
+    image_prev = torch.rand(
+        2,
+        3,
+        120,
+        120,
+    )
+    image_curr = torch.rand(
+        2,
+        3,
+        120,
+        120,
+    )
+
+    with torch.no_grad():
+        outputs = model(
+            image_prev=image_prev,
+            image_curr=image_curr,
+            depth_curr=None,
+            return_intermediates=True,
+        )
+
+    assert outputs[
+        "directional_translation"
+    ].shape == (2, 3)
+
+    assert torch.isfinite(
+        outputs["directional_translation"]
+    ).all()
+
+    assert (
+        model.translation_head.decoder_type
+        == "pooled_mlp"
+    )
+
+    assert (
+        model.translation_head.representation_dim
+        == 128
+    )
+
+    assert (
+        model.translation_head.conv.out_channels
+        == 8
+    )
+
+    assert (
+        model.translation_head.pool.output_size
+        == (4, 4)
+    )
+
+    assert (
+        model.translation_head.dense[0].in_features
+        == 128
+    )
+
+    assert (
+        model.translation_head.dense[0].out_features
+        == 64
+    )
+
+    assert (
+        model.translation_head.dense[2].out_features
+        == 3
+    )
+
+def test_pooled_mlp_compact_representation_shape():
+    head = DirectionalTranslationHead(
+        in_channels=7,
+        input_size=(120, 120),
+        decoder_type="pooled_mlp",
+        projection_channels=8,
+        pool_size=(4, 4),
+        aggregation_hidden_dim=64,
+    )
+
+    head.eval()
+
+    features = torch.rand(
+        2,
+        7,
+        120,
+        120,
+    )
+
+    captured = {}
+
+    def capture_representation(
+        module,
+        inputs,
+    ):
+        captured["value"] = inputs[0].detach()
+
+    hook = (
+        head.representation_input_module()
+        .register_forward_pre_hook(
+            capture_representation
+        )
+    )
+
+    try:
+        with torch.no_grad():
+            prediction = head(features)
+    finally:
+        hook.remove()
+
+    assert prediction.shape == (2, 3)
+    assert captured["value"].shape == (
+        2,
+        128,
+    )
 
 def test_a4_uses_internal_semantic_and_depth_cues(
     model,
