@@ -38,6 +38,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from .auxiliary.lite_mono import LiteMonoDepthBranch
+from .auxiliary.monodepth2 import Monodepth2DepthBranch
 from .auxiliary.lraspp_fig2 import LRASPPSemanticBranch
 from .blocks import AResUNet
 from .pose_head import (
@@ -127,6 +128,7 @@ class DeepDCTVO(nn.Module):
         translation_aggregation_hidden_dim: int = 64,
         translation_num_experts: int = 3,
         # Lite-Mono configuration
+        depth_provider: str = "lite_mono",
         depth_checkpoint_dir: Optional[PathLike] = (
             "weights/lite-mono-tiny-640x192"
         ),
@@ -172,6 +174,13 @@ class DeepDCTVO(nn.Module):
         self.semantic_map_mode = str(
             semantic_map_mode
         )
+
+        self.depth_provider = str(depth_provider).lower().replace("-", "_")
+        if self.depth_provider not in {"lite_mono", "monodepth2"}:
+            raise ValueError(
+                "depth_provider must be 'lite_mono' or 'monodepth2', "
+                f"but received {depth_provider!r}."
+            )
 
         self.depth_model_name = str(
             depth_model_name
@@ -274,18 +283,29 @@ class DeepDCTVO(nn.Module):
         )
 
         if depth_model is not None:
-            # Dependency injection for unit tests or alternative depth models.
             self.depth_model = depth_model
-        else:
+        elif self.depth_provider == "lite_mono":
             self.depth_model = LiteMonoDepthBranch(
                 checkpoint_dir=depth_checkpoint_dir,
                 model_name=self.depth_model_name,
                 feed_size=depth_feed_size,
                 output_mode=self.depth_output_mode,
-                normalization_depth=(
-                    self.depth_normalization_meters
-                ),
+                normalization_depth=self.depth_normalization_meters,
                 freeze_pretrained=freeze_depth,
+            )
+        else:
+            if depth_checkpoint_dir is None:
+                raise ValueError(
+                    "depth_checkpoint_dir is required for Monodepth2."
+                )
+            self.depth_model = Monodepth2DepthBranch(
+                checkpoint_dir=depth_checkpoint_dir,
+                num_layers=18,
+                feed_size=depth_feed_size,
+                output_mode=self.depth_output_mode,
+                normalization_depth=self.depth_normalization_meters,
+                freeze_pretrained=freeze_depth,
+                strict_checkpoint=True,
             )
 
         # Siamese across timestamps within Model R.
@@ -748,6 +768,20 @@ class DeepDCTVO(nn.Module):
                     ),
                 }
             )
+
+            if (
+                self.translation_head.decoder_type
+                in {
+                    "pooled_mlp",
+                    "pooled_linear",
+                }
+            ):
+                outputs["translation_representation"] = (
+                    self.translation_head
+                    .extract_compact_representation(
+                        translation_features
+                    )
+                )
 
             # -----------------------------------------------------------
             # Translation conditioning diagnostics
